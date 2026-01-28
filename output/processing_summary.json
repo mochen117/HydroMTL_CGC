@@ -1,0 +1,44 @@
+{
+  "processing_date": "2026-01-28T16:00:39.651619",
+  "config": {
+    "data_root": "/home/mochen/hydro_data",
+    "output_dir": "output",
+    "start_date": "2001-01-01",
+    "end_date": "2021-09-30",
+    "min_streamflow_coverage": 0.95,
+    "output_format": "netcdf",
+    "max_basins": 5,
+    "selected_basins": null
+  },
+  "statistics": {
+    "total_basins_available": 4,
+    "basins_processed": 0,
+    "basins_failed": 4,
+    "basins_skipped": 0,
+    "success_rate": 0.0
+  },
+  "processed_basins": [],
+  "failed_basins": [
+    {
+      "basin_id": "01013500",
+      "reason": "No streamflow data",
+      "timestamp": "2026-01-28T16:00:39.625592"
+    },
+    {
+      "basin_id": "01022500",
+      "reason": "No streamflow data",
+      "timestamp": "2026-01-28T16:00:39.632490"
+    },
+    {
+      "basin_id": "01030500",
+      "reason": "No streamflow data",
+      "timestamp": "2026-01-28T16:00:39.644661"
+    },
+    {
+      "basin_id": "01031500",
+      "reason": "No streamflow data",
+      "timestamp": "2026-01-28T16:00:39.651460"
+    }
+  ],
+  "skipped_basins": []
+}

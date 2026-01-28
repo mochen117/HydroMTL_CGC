@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+
+# 环境
+.env
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# 数据文件（绝对不要推送！）
+../../hydro_data/
+*.npy
+*.pkl
+*.h5
+
+# 复现代码（不要推送）
+../HydroMTL/
+
+# 日志
+*.log
+logs/
+
+# 系统文件
+.cache/
+.vscode-server/
