@@ -26,3 +26,5 @@ logs/
 # 系统文件
 .cache/
 .vscode-server/
+output/
+*.nc

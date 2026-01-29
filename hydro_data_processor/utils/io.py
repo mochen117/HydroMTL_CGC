@@ -65,5 +65,5 @@ def save_dataset(dataset, filepath: str, format: str = 'csv', **kwargs):
         dataset.to_hdf(filepath, key='data', **kwargs)
     else:
         raise ValueError(f"Unsupported format: {format}")
-    
+
     logger.info(f"Saved dataset to {filepath} ({format})")

@@ -1,788 +1,596 @@
 """
-Main pipeline for Hydro Data Processor
-Optimized for cleaner logging
+Main pipeline for Hydro Data Processing.
 """
 
 import pandas as pd
 import xarray as xr
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any
 import logging
 import json
 from datetime import datetime
 import traceback
-import re
 
-from hydro_data_processor.config.settings import ProjectConfig, DataSourceConfig
+from hydro_data_processor.config.settings import ProjectConfig
 from hydro_data_processor.loaders.attribute_loader import AttributeLoader
 from hydro_data_processor.loaders.streamflow_loader import StreamflowLoader
 from hydro_data_processor.loaders.forcing_loader import ForcingLoader
 from hydro_data_processor.loaders.et_loader import ETLoader
 from hydro_data_processor.loaders.smap_loader import SMAPLoader
-from hydro_data_processor.processors.data_merger import DataMerger
-from hydro_data_processor.processors.quality_checker import QualityChecker
-from hydro_data_processor.processors.gap_handler import GapHandler
-from hydro_data_processor.processors.time_processor import TimeProcessor
 from hydro_data_processor.utils.io import save_json
-from hydro_data_processor.utils.time import calculate_coverage
 
 logger = logging.getLogger(__name__)
 
+__all__ = ['HydroDataPipeline']
+
 
 class HydroDataPipeline:
-    """Main pipeline for hydrological data processing."""
-    
+    """Main pipeline for processing hydrological data from multiple sources."""
+
     def __init__(self, config: ProjectConfig):
-        """
-        Initialize pipeline.
-        
-        Args:
-            config: Project configuration
-        """
         self.config = config
-        self.processing_config = config.processing_config
-        self.selected_basins = getattr(config, 'selected_basins', None)
-        
-        # Initialize loaders
+        self.data_root = config.data_root.resolve()
+
         self._initialize_loaders()
-        
-        # Initialize processors
-        self._initialize_processors()
-        
-        # Tracking variables
-        self.processed_basins: List[str] = []
-        self.failed_basins: List[Dict[str, Any]] = []
-        self.skipped_basins: List[Dict[str, Any]] = []
-        self.processing_stats: Dict[str, Any] = {}
-        
-        logger.debug("Pipeline initialized successfully")
-    
+
+        self.processed_gauges: List[str] = []
+        self.failed_gauges: List[Dict] = []
+        self.skipped_gauges: List[Dict] = []
+
+        self.huc2_mapping: Dict[str, str] = {}
+
+        logger.debug("Hydro Data Pipeline initialized")
+        logger.debug(f"Data root (resolved): {self.data_root}")
+
     def _initialize_loaders(self):
-        """Initialize data loaders."""
+        """Initialize all data loaders."""
         logger.debug("Initializing data loaders")
-        
+
         # Attribute loader
-        attribute_config = self.config.data_sources["attributes"]
-        self.attribute_loader = AttributeLoader(attribute_config)
-        logger.debug(f"Attribute loader initialized")
-        
-        # Streamflow loaders (CAMELS and USGS)
-        camels_streamflow_config = self.config.data_sources["camels_streamflow"]
-        self.camels_streamflow_loader = StreamflowLoader(camels_streamflow_config)
-        logger.debug("CAMELS streamflow loader initialized")
-        
-        usgs_streamflow_config = self.config.data_sources["usgs_streamflow"]
-        self.usgs_streamflow_loader = StreamflowLoader(usgs_streamflow_config)
-        logger.debug("USGS streamflow loader initialized")
-        
+        attribute_config = self.config.data_sources.get("attributes")
+        if attribute_config:
+            if not attribute_config.data_source_path.is_absolute():
+                attribute_config.data_source_path = self.data_root / attribute_config.data_source_path
+            self.attribute_loader = AttributeLoader(attribute_config)
+        else:
+            logger.error("No attribute configuration found")
+            self.attribute_loader = None
+
+        # Streamflow loaders
+        camels_streamflow_config = self.config.data_sources.get("camels_streamflow")
+        if camels_streamflow_config:
+            if not camels_streamflow_config.data_source_path.is_absolute():
+                camels_streamflow_config.data_source_path = self.data_root / camels_streamflow_config.data_source_path
+            self.camels_streamflow_loader = StreamflowLoader(camels_streamflow_config)
+        else:
+            logger.error("No CAMELS streamflow configuration found")
+            self.camels_streamflow_loader = None
+
+        # USGS streamflow loader (optional)
+        usgs_streamflow_config = self.config.data_sources.get("usgs_streamflow")
+        if usgs_streamflow_config:
+            if not usgs_streamflow_config.data_source_path.is_absolute():
+                usgs_streamflow_config.data_source_path = self.data_root / usgs_streamflow_config.data_source_path
+            self.usgs_streamflow_loader = StreamflowLoader(usgs_streamflow_config)
+        else:
+            logger.debug("No USGS streamflow configuration found")
+            self.usgs_streamflow_loader = None
+
         # Forcing loader
-        forcing_config = self.config.data_sources["nldas_forcing"]
-        self.forcing_loader = ForcingLoader(forcing_config)
-        logger.debug("Forcing loader initialized")
-        
-        # ET loader
-        et_config = self.config.data_sources["et_data"]
-        self.et_loader = ETLoader(et_config)
-        logger.debug("ET loader initialized")
-        
-        # SMAP loader
-        smap_config = self.config.data_sources["smap_data"]
-        self.smap_loader = SMAPLoader(smap_config)
-        logger.debug("SMAP loader initialized")
-        
-        logger.info(f"All data loaders initialized")
-    
-    def _initialize_processors(self):
-        """Initialize data processors."""
-        logger.debug("Initializing data processors")
-        
-        # Time processor
-        self.time_processor = TimeProcessor(
-            start_date=self.processing_config.start_date,
-            end_date=self.processing_config.end_date
-        )
-        
-        # Data merger
-        self.data_merger = DataMerger(
-            start_date=self.processing_config.start_date,
-            end_date=self.processing_config.end_date
-        )
-        
-        # Quality checker
-        self.quality_checker = QualityChecker(
-            min_streamflow_coverage=self.processing_config.min_streamflow_coverage
-        )
-        
-        # Gap handler
-        self.gap_handler = GapHandler(method='paper')
-        
-        logger.debug("All processors initialized")
-    
-    def _extract_basin_id_from_string(self, basin_str: str) -> Optional[str]:
-        """
-        Extract 8-digit basin ID from a string that may contain additional data.
-        
-        Examples:
-            Input: "02464000;4.27230937713895;3.00240327173169;..."
-            Output: "02464000"
-            
-            Input: "02464146;1.51207298872002;0.363503007312376;..."
-            Output: "02464146"
-        """
-        if not basin_str or pd.isna(basin_str):
-            return None
-        
-        basin_str = str(basin_str).strip()
-        
-        # Split by semicolon and take first part
-        if ';' in basin_str:
-            parts = basin_str.split(';')
-            first_part = parts[0].strip()
+        forcing_config = self.config.data_sources.get("nldas_forcing")
+        if forcing_config:
+            if not forcing_config.data_source_path.is_absolute():
+                forcing_config.data_source_path = self.data_root / forcing_config.data_source_path
+            self.forcing_loader = ForcingLoader(forcing_config)
         else:
-            first_part = basin_str
-        
-        # Extract 8-digit number
-        match = re.search(r'\b\d{8}\b', first_part)
-        if match:
-            return match.group(0)
-        
-        # Try to find any 8-digit sequence
-        digits = re.findall(r'\d+', first_part)
-        for d in digits:
-            if len(d) == 8:
-                return d
-        
-        # If it's a number but not 8 digits, pad it
-        if first_part.isdigit():
-            padded = first_part.zfill(8)
-            if len(padded) == 8:
-                return padded
-        
-        logger.warning(f"Cannot extract 8-digit basin ID from: {basin_str[:50]}...")
-        return None
-    
+            logger.error("No forcing configuration found")
+            self.forcing_loader = None
+
+        # ET loader (optional)
+        et_config = self.config.data_sources.get("et_data")
+        if et_config:
+            if not et_config.data_source_path.is_absolute():
+                et_config.data_source_path = self.data_root / et_config.data_source_path
+            self.et_loader = ETLoader(et_config)
+        else:
+            logger.debug("No ET configuration found")
+            self.et_loader = None
+
+        # SMAP loader (optional)
+        smap_config = self.config.data_sources.get("smap_data")
+        if smap_config:
+            if not smap_config.data_source_path.is_absolute():
+                smap_config.data_source_path = self.data_root / smap_config.data_source_path
+            self.smap_loader = SMAPLoader(smap_config)
+        else:
+            logger.debug("No SMAP configuration found")
+            self.smap_loader = None
+
+        logger.debug("All loaders initialized")
+
     def run(self):
-        """Run the complete data processing pipeline."""
-        logger.info(f"Time period: {self.processing_config.start_date} to {self.processing_config.end_date}")
+        """Run the complete pipeline."""
+        logger.info("=" * 60)
+        logger.info("Hydro Data Processing Pipeline")
+        logger.info("=" * 60)
+        logger.info(f"Data root: {self.data_root}")
         logger.info(f"Output directory: {self.config.output_dir}")
-        logger.info(f"Max basins: {self.config.max_basins}")
-        
-        # Step 1: Load basin attributes
-        logger.info("Loading basin attributes")
-        attributes_df = self.attribute_loader.load(
-            max_basins=self.config.max_basins
-        )
-        
+        logger.info(f"Max gauges: {self.config.max_basins}")
+        logger.info(f"Study period: {self.config.processing_config.start_date} to {self.config.processing_config.end_date}")
+
+        # Step 1: Load gauge attributes and HUC2 mapping
+        if not self.attribute_loader:
+            logger.error("Attribute loader not available")
+            return
+
+        logger.info("Step 1: Loading gauge attributes and HUC2 mapping")
+        attributes_df = self.attribute_loader.load(max_basins=self.config.max_basins)
+
         if attributes_df.empty:
-            logger.error("No basin attributes loaded. Exiting.")
+            logger.error("No attributes loaded. Exiting.")
             return
-        
-        logger.info(f"Loaded attributes for {len(attributes_df)} rows")
-        
-        # Step 1.5: Clean and extract basin IDs from attributes
-        # The attribute file seems to have full rows with basin_id as first column
-        logger.info("Processing basin attributes to extract basin IDs...")
-        
-        # Extract clean basin IDs from the 'basin_id' column
-        if 'basin_id' in attributes_df.columns:
-            # Create a new column with cleaned basin IDs
-            attributes_df['basin_id_clean'] = attributes_df['basin_id'].apply(
-                self._extract_basin_id_from_string
-            )
-            
-            # Remove rows where we couldn't extract a basin ID
-            original_count = len(attributes_df)
-            attributes_df = attributes_df.dropna(subset=['basin_id_clean'])
-            removed_count = original_count - len(attributes_df)
-            
-            if removed_count > 0:
-                logger.warning(f"Removed {removed_count} rows with invalid basin IDs")
-            
-            # Use the cleaned IDs
-            basin_ids = attributes_df['basin_id_clean'].tolist()
-            logger.info(f"Extracted {len(basin_ids)} valid basin IDs from attributes")
-            
-            # Show sample of extracted IDs
-            if len(basin_ids) > 0:
-                logger.info(f"Sample basin IDs: {basin_ids[:5]}")
+
+        # Ensure gauge_id column exists
+        if 'basin_id' in attributes_df.columns and 'gauge_id' not in attributes_df.columns:
+            attributes_df = attributes_df.rename(columns={'basin_id': 'gauge_id'})
+            logger.debug("Renamed 'basin_id' column to 'gauge_id'")
+
+        if 'gauge_id' not in attributes_df.columns:
+            logger.error("No gauge_id column found in attributes")
+            return
+
+        # Format gauge_id to 8-digit string
+        def ensure_8_digits(gauge_id):
+            if gauge_id is None:
+                return None
+            gauge_str = str(gauge_id)
+            if len(gauge_str) == 7:
+                return '0' + gauge_str
+            elif len(gauge_str) < 8:
+                return gauge_str.zfill(8)
+            return gauge_str
+
+        attributes_df['gauge_id'] = attributes_df['gauge_id'].astype(str).apply(ensure_8_digits)
+
+        # Extract HUC2 mapping
+        if 'huc_02' in attributes_df.columns:
+            attributes_df['huc_02'] = attributes_df['huc_02'].astype(str).str.zfill(2)
+            self.huc2_mapping = dict(zip(attributes_df['gauge_id'], attributes_df['huc_02']))
+            logger.info(f"Loaded HUC2 mapping for {len(self.huc2_mapping)} gauges")
+            # Log first few mappings for debugging
+            for gauge_id, huc2 in list(self.huc2_mapping.items())[:3]:
+                logger.debug(f"HUC2 mapping: {gauge_id} -> {huc2}")
         else:
-            logger.error("'basin_id' column not found in attributes DataFrame")
-            logger.error(f"Available columns: {list(attributes_df.columns)}")
-            return
-        
-        # Step 2: Process each basin
-        total_basins = len(basin_ids)
-        logger.info(f"Processing {total_basins} basins")
-        
-        for i, basin_id in enumerate(basin_ids):
-            logger.info(f"[{i+1}/{total_basins}] Processing basin {basin_id}")
-            
+            logger.debug("No huc_02 column found in attributes")
+
+        logger.debug(f"Attributes loaded: {len(attributes_df)} gauges")
+        logger.debug(f"First gauge IDs: {attributes_df['gauge_id'].head().tolist()}")
+
+        # Get gauge IDs to process
+        gauge_ids = attributes_df['gauge_id'].tolist()
+        logger.info(f"Step 2: Processing {len(gauge_ids)} gauges")
+
+        # Process each gauge
+        for i, gauge_id in enumerate(gauge_ids, 1):
+            logger.info(f"[{i}/{len(gauge_ids)}] Processing gauge {gauge_id}")
+
             try:
-                # Check if output already exists
-                if self._output_exists(basin_id) and not self.processing_config.overwrite_existing:
-                    logger.info(f"Output exists, skipping basin {basin_id}")
-                    self.skipped_basins.append({
-                        'basin_id': basin_id,
-                        'reason': 'Output already exists',
-                        'timestamp': datetime.now().isoformat()
-                    })
-                    continue
-                
-                # Process basin
-                success = self._process_basin(basin_id, attributes_df)
-                
+                success = self._process_gauge_with_huc2(gauge_id, attributes_df)
+
                 if success:
-                    self.processed_basins.append(basin_id)
-                    logger.info(f"Basin {basin_id} processed successfully")
+                    self.processed_gauges.append(gauge_id)
+                    logger.info(f"✓ Gauge {gauge_id} processed successfully")
                 else:
-                    logger.warning(f"Failed to process basin {basin_id}")
-                
+                    self.failed_gauges.append({'gauge_id': gauge_id, 'reason': 'Processing failed'})
+                    logger.warning(f"✗ Failed to process gauge {gauge_id}")
+
             except Exception as e:
-                logger.error(f"Error processing basin {basin_id}: {e}")
-                if logger.isEnabledFor(logging.DEBUG):
-                    traceback.print_exc()
-                self._record_failure(basin_id, str(e))
-        
-        # Step 3: Create combined dataset if multiple basins processed
-        if len(self.processed_basins) > 1:
-            logger.info(f"Creating combined dataset from {len(self.processed_basins)} basins")
-            self._create_combined_dataset()
-        
-        # Step 4: Save processing summary
-        logger.info("Saving processing summary")
-        self._save_processing_summary(attributes_df)
-        
-        # Final statistics
-        logger.info(f"Processing completed:")
-        logger.info(f"  Successfully processed: {len(self.processed_basins)} basins")
-        logger.info(f"  Failed: {len(self.failed_basins)} basins")
-        logger.info(f"  Skipped: {len(self.skipped_basins)} basins")
-        
-        if self.failed_basins:
-            logger.info(f"First 5 failed basins:")
-            for failure in self.failed_basins[:5]:
-                logger.info(f"  {failure['basin_id']}: {failure['reason']}")
-    
-    def _process_basin(self, basin_id: str, attributes_df: pd.DataFrame) -> bool:
-        """
-        Process a single basin.
-        
-        Args:
-            basin_id: Basin ID (8-digit string)
-            attributes_df: DataFrame with basin attributes
-            
-        Returns:
-            True if successful
-        """
-        try:
-            # 1. Get basin attributes
-            basin_attrs = self._extract_basin_attributes(attributes_df, basin_id)
-            if not basin_attrs:
-                self._record_failure(basin_id, "No basin attributes")
-                return False
-            
-            # 2. Load streamflow data
-            camels_streamflow = self.camels_streamflow_loader.load(basin_ids=[basin_id])
-            usgs_streamflow = self.usgs_streamflow_loader.load(basin_ids=[basin_id])
-            
-            # Merge streamflow sources
-            merged_streamflow = self._merge_streamflow_sources(camels_streamflow, usgs_streamflow, basin_id)
-            if merged_streamflow is None or merged_streamflow.empty:
-                self._record_failure(basin_id, "No streamflow data")
-                return False
-            
-            # Check streamflow coverage
-            streamflow_coverage = merged_streamflow['streamflow'].notna().mean()
-            if streamflow_coverage < self.processing_config.min_streamflow_coverage:
-                self._record_failure(basin_id, f"Streamflow coverage too low: {streamflow_coverage:.1%}")
-                return False
-            
-            logger.info(f"Basin {basin_id}: Streamflow coverage {streamflow_coverage:.1%}")
-            
-            # 3. Load forcing data
-            forcing_data = self.forcing_loader.load(basin_ids=[basin_id])
-            if forcing_data is None or forcing_data.empty:
-                self._record_failure(basin_id, "No forcing data")
-                return False
-            
-            # 4. Load ET data (optional)
-            et_data = self.et_loader.load(basin_ids=[basin_id])
-            if et_data is None or et_data.empty:
-                logger.debug(f"No ET data for basin {basin_id}")
-            
-            # 5. Load SMAP data (optional)
-            smap_data = self.smap_loader.load(basin_ids=[basin_id])
-            if smap_data is None or smap_data.empty:
-                logger.debug(f"No SMAP data for basin {basin_id}")
-            
-            # 6. Merge all data
-            merged_df = self.data_merger.merge_basin_data(
-                streamflow_data=merged_streamflow,
-                forcing_data=forcing_data,
-                et_data=et_data,
-                smap_data=smap_data
-            )
-            
-            if merged_df is None or merged_df.empty:
-                self._record_failure(basin_id, "Data merge failed")
-                return False
-            
-            # 7. Handle gaps
-            merged_df = self.gap_handler.handle_missing_data(merged_df)
-            
-            # 8. Check data quality
-            quality_check = self.quality_checker.check_dataset_quality(merged_df)
-            
-            if not quality_check['overall_valid']:
-                issues = quality_check.get('issues', [])
-                if issues:
-                    issue_msg = "; ".join(issues[:3])
-                    self._record_failure(basin_id, f"Quality issues: {issue_msg}")
-                else:
-                    self._record_failure(basin_id, "Quality check failed")
-                return False
-            
-            # 9. Create xarray dataset
-            dataset = self.data_merger.create_xarray_dataset(merged_df, basin_id, basin_attrs)
-            if dataset is None:
-                self._record_failure(basin_id, "Dataset creation failed")
-                return False
-            
-            # 10. Save dataset
-            success = self._save_dataset(dataset, basin_id)
-            if not success:
-                self._record_failure(basin_id, "Dataset save failed")
-                return False
-            
-            # 11. Save quality report
-            self._save_quality_report(quality_check, basin_id)
-            
-            logger.debug(f"Basin {basin_id} processed successfully")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error processing basin {basin_id}: {e}")
-            if logger.isEnabledFor(logging.DEBUG):
+                logger.error(f"Error processing gauge {gauge_id}: {e}")
                 traceback.print_exc()
-            self._record_failure(basin_id, str(e))
+                self.failed_gauges.append({'gauge_id': gauge_id, 'reason': str(e)[:100]})
+
+        # Generate summary
+        logger.info("Step 3: Generating processing summary")
+        self._generate_summary(attributes_df)
+
+        logger.info("=" * 60)
+        logger.info(f"Pipeline completed:")
+        logger.info(f"  Successfully processed: {len(self.processed_gauges)} gauges")
+        logger.info(f"  Failed: {len(self.failed_gauges)} gauges")
+        logger.info(f"  Skipped: {len(self.skipped_gauges)} gauges")
+
+        if self.failed_gauges:
+            logger.info("First 5 failed gauges:")
+            for failure in self.failed_gauges[:5]:
+                logger.info(f"  {failure['gauge_id']}: {failure['reason']}")
+
+    def _process_gauge_with_huc2(self, gauge_id: str, attributes_df: pd.DataFrame) -> bool:
+        """Process a single gauge with HUC2 directory support."""
+        # Get gauge attributes
+        gauge_attrs = self._get_gauge_attributes(gauge_id, attributes_df)
+
+        # Get HUC2 code
+        huc2 = self._get_huc2_for_gauge(gauge_id, gauge_attrs)
+        if not huc2:
+            logger.debug(f"No HUC2 found for gauge {gauge_id}")
             return False
-    
-    def _extract_basin_attributes(self, attributes_df: pd.DataFrame, 
-                                 basin_id: str) -> Dict[str, Any]:
-        """
-        Extract attributes for a specific basin.
-        
-        Args:
-            attributes_df: DataFrame with all basin attributes
-            basin_id: 8-digit basin ID
-            
-        Returns:
-            Dictionary of basin attributes
-        """
-        # Find the row for this basin_id
-        # First try using the cleaned basin_id column
-        if 'basin_id_clean' in attributes_df.columns:
-            basin_row = attributes_df[attributes_df['basin_id_clean'] == basin_id]
-        else:
-            # Fallback: search in original basin_id column
-            basin_row = attributes_df[attributes_df['basin_id'].astype(str).str.contains(basin_id)]
-        
-        if basin_row is None or basin_row.empty:
-            logger.debug(f"No attributes found for basin {basin_id}")
+
+        # Load streamflow data
+        streamflow_data = self._load_streamflow_with_huc2(gauge_id, huc2)
+        if streamflow_data is None or streamflow_data.empty:
+            logger.warning(f"No streamflow data for gauge {gauge_id} in HUC2 {huc2}")
+            return False
+
+        # Load forcing data
+        forcing_data = self._load_forcing_with_huc2(gauge_id, huc2)
+        if forcing_data is None or forcing_data.empty:
+            logger.warning(f"No forcing data for gauge {gauge_id} in HUC2 {huc2}")
+            return False
+
+        # Load optional ET data
+        et_data = None
+        if self.et_loader:
+            et_data = self.et_loader.load([gauge_id], huc2=huc2)
+            if et_data is None or et_data.empty:
+                logger.debug(f"No ET data for gauge {gauge_id}")
+
+        # Load optional SMAP data
+        smap_data = None
+        if self.smap_loader:
+            smap_data = self.smap_loader.load([gauge_id], huc2=huc2)
+            if smap_data is None or smap_data.empty:
+                logger.debug(f"No SMAP data for gauge {gauge_id}")
+
+        # Merge all data
+        merged_data = self._merge_all_data(streamflow_data, forcing_data, et_data, smap_data, gauge_id)
+
+        if merged_data is None or merged_data.empty:
+            logger.warning(f"Failed to merge data for gauge {gauge_id}")
+            return False
+
+        # Create and save dataset
+        success = self._create_and_save_dataset(merged_data, gauge_attrs, gauge_id)
+        return success
+
+    def _get_gauge_attributes(self, gauge_id: str, attributes_df: pd.DataFrame) -> Dict[str, Any]:
+        """Extract attributes for a specific gauge."""
+        # Ensure gauge_id is 8-digit for comparison
+        gauge_id_8 = gauge_id.zfill(8) if len(gauge_id) < 8 else gauge_id
+
+        # Look for exact match
+        gauge_row = attributes_df[attributes_df['gauge_id'].astype(str) == gauge_id_8]
+
+        if gauge_row.empty:
+            gauge_row = attributes_df[attributes_df['gauge_id'].astype(str) == gauge_id]
+
+        if gauge_row.empty:
+            logger.warning(f"No attributes found for gauge {gauge_id}")
             return {}
-        
-        # Take the first matching row
-        attrs_series = basin_row.iloc[0]
-        
-        # Parse the original basin_id string to extract all attributes
-        original_basin_str = str(attrs_series['basin_id'])
+
+        attrs = gauge_row.iloc[0].to_dict()
         clean_attrs = {}
-        
-        # Split by semicolon to get all fields
-        if ';' in original_basin_str:
-            parts = original_basin_str.split(';')
-            
-            # The first part is the basin ID (should match our basin_id)
-            if parts[0].strip() != basin_id:
-                logger.warning(f"Mismatch: extracted basin_id {basin_id} != {parts[0].strip()}")
-            
-            # Store all parts as attributes
-            for i, part in enumerate(parts):
-                key = f"attr_{i}" if i > 0 else "basin_id"
-                value = part.strip()
-                
-                # Try to convert to numeric if possible
-                try:
-                    if '.' in value:
-                        value = float(value)
-                    else:
-                        value = int(value)
-                except (ValueError, TypeError):
-                    pass
-                
-                clean_attrs[key] = value
-        else:
-            # If no semicolons, just store the whole string
-            clean_attrs['basin_id'] = basin_id
-            clean_attrs['original'] = original_basin_str
-        
-        # Also include any other columns from the attributes DataFrame
-        for col in attrs_series.index:
-            if col != 'basin_id' and col != 'basin_id_clean':
-                value = attrs_series[col]
-                if pd.notna(value):
-                    if isinstance(value, (int, np.integer)):
-                        clean_attrs[col] = int(value)
-                    elif isinstance(value, (float, np.floating)):
-                        clean_attrs[col] = float(value)
-                    elif isinstance(value, str):
-                        clean_attrs[col] = value
-                    else:
-                        clean_attrs[col] = str(value)
-        
-        logger.debug(f"Extracted {len(clean_attrs)} attributes for basin {basin_id}")
-        return clean_attrs
-        
-    def _merge_streamflow_sources(self, camels_df: pd.DataFrame, 
-                                 usgs_df: pd.DataFrame, 
-                                 basin_id: str) -> pd.DataFrame:
-        """
-        Merge CAMELS and USGS streamflow data.
-        
-        Args:
-            camels_df: CAMELS streamflow data (1980-2014)
-            usgs_df: USGS streamflow data (2015-2021)
-            basin_id: Basin ID
-            
-        Returns:
-            Merged streamflow data
-        """
-        # Create base dataframe for study period
-        base_dates = self.time_processor.create_study_period_index()
-        merged_df = pd.DataFrame({'date': base_dates})
-        
-        # Function to prepare streamflow data
-        def prepare_streamflow(df, source_name):
-            if df is None or df.empty:
-                logger.debug(f"{source_name} streamflow data is empty")
-                return pd.DataFrame()
-            
-            df = df.copy()
-            
-            # Ensure date column
-            if 'date' not in df.columns:
-                logger.error(f"{source_name} data missing 'date' column")
-                return pd.DataFrame()
-            
-            # Ensure streamflow column
-            streamflow_col = None
-            for col in ['streamflow', 'q_obs', 'discharge', 'Q']:
-                if col in df.columns:
-                    streamflow_col = col
-                    break
-            
-            if streamflow_col is None:
-                logger.error(f"{source_name} data missing streamflow column")
-                return pd.DataFrame()
-            
-            # Select and rename columns
-            df = df[['date', streamflow_col]].copy()
-            df = df.rename(columns={streamflow_col: 'streamflow'})
-            
-            # Convert to datetime and ensure within study period
-            df['date'] = pd.to_datetime(df['date'])
-            df = df[
-                (df['date'] >= self.time_processor.study_start) & 
-                (df['date'] <= self.time_processor.study_end)
-            ]
-            
-            # Add basin_id
-            df['basin_id'] = basin_id
-            
-            return df
-        
-        # Prepare both data sources
-        camels_prepared = prepare_streamflow(camels_df, "CAMELS")
-        usgs_prepared = prepare_streamflow(usgs_df, "USGS")
-        
-        # Merge with preference for USGS data (2015 onwards)
-        if not camels_prepared.empty and not usgs_prepared.empty:
-            temp_merge = pd.merge(
-                camels_prepared, 
-                usgs_prepared, 
-                on=['date', 'basin_id'], 
-                how='outer',
-                suffixes=('_camels', '_usgs')
-            )
-            
-            if 'streamflow_camels' in temp_merge.columns and 'streamflow_usgs' in temp_merge.columns:
-                cutoff_date = pd.Timestamp('2015-01-01')
-                
-                temp_merge['streamflow'] = np.where(
-                    temp_merge['date'] < cutoff_date,
-                    temp_merge['streamflow_camels'],
-                    temp_merge['streamflow_usgs']
-                )
-                
-                temp_merge['streamflow'] = temp_merge['streamflow'].fillna(
-                    temp_merge['streamflow_camels']
-                )
-                
-                merged_df = pd.merge(merged_df, temp_merge[['date', 'streamflow', 'basin_id']], 
-                                   on='date', how='left')
-            else:
-                merged_df = pd.merge(merged_df, camels_prepared[['date', 'streamflow', 'basin_id']], 
-                                   on='date', how='left')
-        
-        elif not camels_prepared.empty:
-            merged_df = pd.merge(merged_df, camels_prepared[['date', 'streamflow', 'basin_id']], 
-                               on='date', how='left')
-        elif not usgs_prepared.empty:
-            merged_df = pd.merge(merged_df, usgs_prepared[['date', 'streamflow', 'basin_id']], 
-                               on='date', how='left')
-        else:
-            logger.error(f"No streamflow data available for basin {basin_id}")
-            return pd.DataFrame()
-        
-        # Ensure basin_id is present
-        if 'basin_id' not in merged_df.columns:
-            merged_df['basin_id'] = basin_id
-        
-        return merged_df
-    
-    def _extract_basin_attributes(self, attributes_df: pd.DataFrame, 
-                                 basin_id: str) -> Dict[str, Any]:
-        """
-        Extract attributes for a specific basin.
-        
-        Args:
-            attributes_df: DataFrame with all basin attributes
-            basin_id: 8-digit basin ID
-            
-        Returns:
-            Dictionary of basin attributes
-        """
-        attributes_df = attributes_df.copy()
-        
-        if 'basin_id' in attributes_df.columns:
-            attributes_df['basin_id'] = attributes_df['basin_id'].astype(str)
-            basin_row = attributes_df[attributes_df['basin_id'] == basin_id]
-        else:
-            basin_row = None
-            for col in attributes_df.columns:
-                if attributes_df[col].astype(str).str.contains(basin_id).any():
-                    basin_row = attributes_df[attributes_df[col].astype(str) == basin_id]
-                    break
-        
-        if basin_row is None or basin_row.empty:
-            logger.debug(f"No attributes found for basin {basin_id}")
-            return {}
-        
-        attrs = basin_row.iloc[0].to_dict()
-        clean_attrs = {}
-        
         for key, value in attrs.items():
-            if pd.isna(value):
-                continue
-            
-            if isinstance(value, (int, np.integer)):
+            if isinstance(value, (np.integer, np.int64)):
                 clean_attrs[key] = int(value)
-            elif isinstance(value, (float, np.floating)):
+            elif isinstance(value, (np.floating, np.float64)):
                 clean_attrs[key] = float(value)
-            elif isinstance(value, str):
-                clean_attrs[str(key)] = value
+            elif isinstance(value, np.ndarray):
+                clean_attrs[key] = value.tolist()
+            elif pd.isna(value):
+                continue
             else:
-                clean_attrs[str(key)] = str(value)
-        
+                clean_attrs[key] = value
+
         return clean_attrs
-    
-    def _output_exists(self, basin_id: str) -> bool:
-        """Check if output file already exists."""
-        if self.processing_config.output_format == "netcdf":
-            output_file = self.config.output_dir / f"basin_{basin_id}.nc"
-        elif self.processing_config.output_format == "hdf5":
-            output_file = self.config.output_dir / f"basin_{basin_id}.h5"
-        else:
-            output_file = self.config.output_dir / f"basin_{basin_id}.parquet"
-        
-        return output_file.exists()
-    
-    def _save_dataset(self, dataset, basin_id: str) -> bool:
-        """Save dataset to file."""
+
+    def _get_huc2_for_gauge(self, gauge_id: str, gauge_attrs: Dict[str, Any]) -> Optional[str]:
+        """Get HUC2 code for a gauge from mapping or attributes."""
+        # Ensure gauge_id is 8-digit
+        gauge_id_8 = gauge_id.zfill(8)
+
+        # First check cache
+        if gauge_id_8 in self.huc2_mapping:
+            huc2 = self.huc2_mapping[gauge_id_8]
+            if huc2 and pd.notna(huc2):
+                huc2_str = str(huc2).zfill(2)
+                logger.debug(f"Found HUC2 {huc2_str} for gauge {gauge_id} from cache")
+                return huc2_str
+
+        # Check gauge attributes
+        if 'huc_02' in gauge_attrs and gauge_attrs['huc_02']:
+            huc2 = gauge_attrs['huc_02']
+            huc2_str = str(huc2).zfill(2)
+            logger.debug(f"Found HUC2 {huc2_str} for gauge {gauge_id} from attributes")
+            return huc2_str
+
+        logger.debug(f"No HUC2 mapping found for gauge {gauge_id}")
+        return None
+
+    def _load_streamflow_with_huc2(self, gauge_id: str, huc2: str) -> Optional[pd.DataFrame]:
+        """Load streamflow data for a gauge using HUC2 directory."""
+        if not self.camels_streamflow_loader:
+            return None
+
         try:
+            data = self.camels_streamflow_loader.load([gauge_id])
+            if data is not None and not data.empty:
+                return data
+        except Exception as e:
+            logger.debug(f"Loader failed for gauge {gauge_id}: {e}")
+
+        return self._load_streamflow_direct(gauge_id, huc2)
+
+    def _load_streamflow_direct(self, gauge_id: str, huc2: str) -> Optional[pd.DataFrame]:
+        """Direct file access for streamflow data."""
+        camels_config = self.config.data_sources.get("camels_streamflow")
+        if not camels_config:
+            return None
+
+        file_path = camels_config.get_file_path(gauge_id, huc2)
+        if not file_path.exists():
+            return None
+
+        try:
+            df = pd.read_csv(file_path, sep=r'\s+', header=None, dtype=str)
+
+            if df.shape[1] == 6:
+                df.columns = ['file_gauge_id', 'year', 'month', 'day', 'streamflow', 'qc_flag']
+            elif df.shape[1] == 5:
+                df.columns = ['file_gauge_id', 'year', 'month', 'day', 'streamflow']
+                df['qc_flag'] = None
+
+            df['year'] = df['year'].astype(int)
+            df['month'] = df['month'].astype(int)
+            df['day'] = df['day'].astype(int)
+            df['streamflow'] = pd.to_numeric(df['streamflow'], errors='coerce')
+
+            df['date'] = pd.to_datetime(df[['year', 'month', 'day']])
+            df['gauge_id'] = gauge_id
+
+            logger.debug(f"Loaded streamflow from {file_path}")
+            return df[['date', 'streamflow', 'qc_flag', 'gauge_id']]
+
+        except Exception as e:
+            logger.warning(f"Failed to read streamflow file {file_path}: {e}")
+            return None
+
+    def _load_forcing_with_huc2(self, gauge_id: str, huc2: str) -> Optional[pd.DataFrame]:
+        """Load forcing data for a gauge using HUC2 directory."""
+        if not self.forcing_loader:
+            return None
+
+        try:
+            data = self.forcing_loader.load([gauge_id], huc2=huc2)
+            if data is not None and not data.empty:
+                logger.debug(f"Loaded forcing data for gauge {gauge_id} using loader")
+                return data
+        except Exception as e:
+            logger.debug(f"Forcing loader failed for gauge {gauge_id}: {e}")
+
+        return self._load_forcing_direct(gauge_id, huc2)
+
+    def _load_forcing_direct(self, gauge_id: str, huc2: str) -> Optional[pd.DataFrame]:
+        """Direct file access for forcing data."""
+        forcing_config = self.config.data_sources.get("nldas_forcing")
+        if not forcing_config:
+            return None
+
+        huc2_2digit = str(huc2).zfill(2)
+
+        possible_paths = [
+            forcing_config.data_source_path / "basin_mean_forcing" / huc2_2digit / f"{gauge_id}_lump_nldas_forcing_leap.txt",
+            forcing_config.data_source_path / huc2_2digit / f"{gauge_id}_lump_nldas_forcing_leap.txt",
+        ]
+
+        file_path = None
+        for path in possible_paths:
+            if path.exists():
+                file_path = path
+                logger.debug(f"Found forcing file at: {path}")
+                break
+
+        if not file_path or not file_path.exists():
+            logger.warning(f"Forcing file not found for gauge {gauge_id} in HUC2 {huc2}")
+            return None
+
+        try:
+            df = pd.read_csv(file_path, sep=r'\s+', header=0)
+
+            column_mapping = {
+                'Year': 'year',
+                'Mnth': 'month',
+                'Day': 'day',
+                'Hr': 'hour',
+                'temperature(C)': 'temperature',
+                'specific_humidity(kg/kg)': 'specific_humidity',
+                'pressure(Pa)': 'pressure',
+                'wind_u(m/s)': 'wind_u',
+                'wind_v(m/s)': 'wind_v',
+                'longwave_radiation(W/m^2)': 'longwave_radiation',
+                'convective_fraction(-)': 'convective_fraction',
+                'shortwave_radiation(W/m^2)': 'shortwave_radiation',
+                'potential_energy(J/kg)': 'potential_energy',
+                'potential_evaporation(kg/m^2)': 'potential_evaporation',
+                'total_precipitation(kg/m^2)': 'total_precipitation'
+            }
+
+            df = df.rename(columns=column_mapping)
+
+            df['year'] = df['year'].astype(int)
+            df['month'] = df['month'].astype(int)
+            df['day'] = df['day'].astype(int)
+
+            df['date'] = pd.to_datetime(df[['year', 'month', 'day']])
+
+            numeric_cols = ['temperature', 'specific_humidity', 'pressure', 'wind_u', 'wind_v',
+                           'longwave_radiation', 'convective_fraction', 'shortwave_radiation',
+                           'potential_energy', 'potential_evaporation', 'total_precipitation']
+
+            for col in numeric_cols:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+
+            df['gauge_id'] = gauge_id
+            df = df.drop(columns=['year', 'month', 'day', 'hour'])
+
+            cols = ['date', 'gauge_id'] + [c for c in df.columns if c not in ['date', 'gauge_id']]
+            df = df[cols]
+
+            logger.debug(f"Loaded forcing data from {file_path} with {len(df)} records")
+            return df
+
+        except Exception as e:
+            logger.warning(f"Failed to read forcing file {file_path}: {e}")
+            return None
+
+    def _merge_all_data(self, streamflow_df: pd.DataFrame,
+                       forcing_df: pd.DataFrame,
+                       et_df: Optional[pd.DataFrame],
+                       smap_df: Optional[pd.DataFrame],
+                       gauge_id: str) -> Optional[pd.DataFrame]:
+        """Merge all data sources for a gauge."""
+        if streamflow_df is None or streamflow_df.empty:
+            return None
+
+        merged_df = streamflow_df.copy()
+
+        if forcing_df is not None and not forcing_df.empty:
+            forcing_cols_to_drop = [col for col in ['gauge_id'] if col in forcing_df.columns]
+            merged_df = pd.merge(
+                merged_df,
+                forcing_df.drop(columns=forcing_cols_to_drop),
+                on='date',
+                how='inner'
+            )
+
+        if et_df is not None and not et_df.empty:
+            et_cols_to_drop = [col for col in ['gauge_id'] if col in et_df.columns]
+            merged_df = pd.merge(
+                merged_df,
+                et_df.drop(columns=et_cols_to_drop),
+                on='date',
+                how='left'
+            )
+
+        if smap_df is not None and not smap_df.empty:
+            smap_cols_to_drop = [col for col in ['gauge_id'] if col in smap_df.columns]
+            merged_df = pd.merge(
+                merged_df,
+                smap_df.drop(columns=smap_cols_to_drop),
+                on='date',
+                how='left'
+            )
+
+        merged_df['gauge_id'] = str(gauge_id).zfill(8)
+
+        return merged_df
+
+    def _create_and_save_dataset(self, data_df: pd.DataFrame,
+                                gauge_attrs: Dict[str, Any],
+                                gauge_id: str) -> bool:
+        """Create and save dataset for a gauge."""
+        try:
+            gauge_id_8 = str(gauge_id).zfill(8)
+
             self.config.output_dir.mkdir(parents=True, exist_ok=True)
-            
-            if self.processing_config.output_format == "netcdf":
-                filename = f"basin_{basin_id}.nc"
-                filepath = self.config.output_dir / filename
-                dataset.to_netcdf(filepath)
-                
-            elif self.processing_config.output_format == "hdf5":
-                filename = f"basin_{basin_id}.h5"
-                filepath = self.config.output_dir / filename
-                dataset.to_netcdf(filepath)
-                
+
+            dataset = xr.Dataset.from_dataframe(data_df.set_index('date'))
+
+            gauge_attrs['gauge_id'] = gauge_id_8
+            dataset.attrs.update(gauge_attrs)
+            dataset.attrs['creation_date'] = datetime.now().isoformat()
+
+            output_format = self.config.processing_config.output_format
+
+            if output_format == "netcdf":
+                output_file = self.config.output_dir / f"gauge_{gauge_id_8}.nc"
+                dataset.to_netcdf(output_file)
+            elif output_format == "hdf5":
+                output_file = self.config.output_dir / f"gauge_{gauge_id_8}.h5"
+                dataset.to_netcdf(output_file)
             else:
-                df = dataset.to_dataframe()
-                filename = f"basin_{basin_id}.parquet"
-                filepath = self.config.output_dir / filename
-                df.to_parquet(filepath)
-            
-            logger.debug(f"Dataset saved: {filepath}")
+                output_file = self.config.output_dir / f"gauge_{gauge_id_8}.parquet"
+                data_df.to_parquet(output_file)
+
+            logger.debug(f"Dataset saved: {output_file}")
             return True
-            
+
         except Exception as e:
-            logger.error(f"Failed to save dataset for basin {basin_id}: {e}")
+            logger.error(f"Failed to save dataset for gauge {gauge_id}: {e}")
             return False
-    
-    def _save_quality_report(self, quality_check: Dict[str, Any], basin_id: str):
-        """Save quality check report for a basin."""
-        try:
-            report_dir = self.config.output_dir / "quality_reports"
-            report_dir.mkdir(parents=True, exist_ok=True)
-            
-            report_file = report_dir / f"quality_{basin_id}.json"
-            
-            quality_check['basin_id'] = basin_id
-            quality_check['timestamp'] = datetime.now().isoformat()
-            
-            save_json(quality_check, report_file)
-            logger.debug(f"Quality report saved: {report_file}")
-            
-        except Exception as e:
-            logger.debug(f"Failed to save quality report for basin {basin_id}: {e}")
-    
-    def _create_combined_dataset(self):
-        """Create combined dataset from all processed basins."""
-        if not self.processed_basins:
-            logger.warning("No processed basins to combine")
-            return
-        
-        logger.info(f"Creating combined dataset from {len(self.processed_basins)} basins")
-        
-        try:
-            combined_datasets = []
-            
-            for basin_id in self.processed_basins:
-                if self.processing_config.output_format == "netcdf":
-                    filepath = self.config.output_dir / f"basin_{basin_id}.nc"
-                    if filepath.exists():
-                        ds = xr.open_dataset(filepath)
-                        combined_datasets.append(ds)
-                
-                elif self.processing_config.output_format == "hdf5":
-                    filepath = self.config.output_dir / f"basin_{basin_id}.h5"
-                    if filepath.exists():
-                        ds = xr.open_dataset(filepath)
-                        combined_datasets.append(ds)
-            
-            if combined_datasets:
-                combined = xr.concat(combined_datasets, dim='basin')
-                
-                combined_file = self.config.output_dir / f"combined_{len(self.processed_basins)}_basins.nc"
-                combined.to_netcdf(combined_file)
-                
-                logger.info(f"Combined dataset saved: {combined_file}")
-            else:
-                logger.warning("No datasets found to combine")
-                
-        except Exception as e:
-            logger.error(f"Failed to create combined dataset: {e}")
-    
-    def _record_failure(self, basin_id: str, reason: str):
-        """Record processing failure."""
-        self.failed_basins.append({
-            'basin_id': basin_id,
-            'reason': reason,
-            'timestamp': datetime.now().isoformat()
-        })
-        
-        logger.debug(f"Recorded failure for basin {basin_id}: {reason}")
-    
-    def _save_processing_summary(self, attributes_df: pd.DataFrame):
-        """Save processing summary to file."""
+
+    def _generate_summary(self, attributes_df: pd.DataFrame):
+        """Generate processing summary."""
         summary = {
             'processing_date': datetime.now().isoformat(),
             'config': {
                 'data_root': str(self.config.data_root),
                 'output_dir': str(self.config.output_dir),
-                'start_date': self.processing_config.start_date,
-                'end_date': self.processing_config.end_date,
-                'min_streamflow_coverage': self.processing_config.min_streamflow_coverage,
-                'output_format': self.processing_config.output_format,
+                'start_date': self.config.processing_config.start_date,
+                'end_date': self.config.processing_config.end_date,
                 'max_basins': self.config.max_basins,
-                'selected_basins': self.selected_basins
+                'output_format': self.config.processing_config.output_format,
+                'overwrite_existing': self.config.processing_config.overwrite_existing
             },
             'statistics': {
-                'total_basins_available': len(attributes_df),
-                'basins_processed': len(self.processed_basins),
-                'basins_failed': len(self.failed_basins),
-                'basins_skipped': len(self.skipped_basins),
-                'success_rate': len(self.processed_basins) / len(attributes_df) if len(attributes_df) > 0 else 0
+                'total_gauges_available': len(attributes_df),
+                'gauges_processed': len(self.processed_gauges),
+                'gauges_failed': len(self.failed_gauges),
+                'gauges_skipped': len(self.skipped_gauges),
+                'success_rate': len(self.processed_gauges) / len(attributes_df)
+                            if len(attributes_df) > 0 else 0
             },
-            'processed_basins': self.processed_basins,
-            'failed_basins': self.failed_basins,
-            'skipped_basins': self.skipped_basins
+            'processed_gauges': self.processed_gauges,
+            'failed_gauges': self.failed_gauges,
+            'skipped_gauges': self.skipped_gauges
         }
-        
+
         summary_file = self.config.output_dir / "processing_summary.json"
-        
-        if save_json(summary, summary_file):
+
+        try:
+            save_json(summary, summary_file)
             logger.info(f"Processing summary saved to {summary_file}")
-        else:
-            logger.error("Failed to save processing summary")
-    
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save processing summary: {e}")
+            return False
+
     def explore_data_structure(self):
         """Explore data structure without processing."""
-        logger.info("Exploring data structure...")
-        
-        attributes_df = self.attribute_loader.load(max_basins=5)
-        
-        if attributes_df.empty:
-            logger.warning("No basin attributes found")
-            return
-        
-        basin_ids = attributes_df['basin_id'].head(3).tolist()
-        
-        exploration_results = {
-            "total_basins_in_attributes": len(attributes_df),
-            "sample_basins": basin_ids,
-            "data_availability": {}
-        }
-        
-        for basin_id in basin_ids:
-            logger.info(f"Exploring data for basin {basin_id}")
-            
-            availability = {}
-            
-            for source_name, loader in [
-                ("camels_streamflow", self.camels_streamflow_loader),
-                ("usgs_streamflow", self.usgs_streamflow_loader),
-                ("nldas_forcing", self.forcing_loader),
-                ("et_data", self.et_loader),
-                ("smap_data", self.smap_loader)
-            ]:
-                try:
-                    data = loader.load(basin_ids=[basin_id])
-                    availability[source_name] = not (data is None or data.empty)
-                except Exception as e:
-                    availability[source_name] = False
-                    logger.debug(f"Error loading {source_name} for {basin_id}: {e}")
-            
-            exploration_results["data_availability"][basin_id] = availability
-            
-            # Log availability
-            available_sources = [k for k, v in availability.items() if v]
-            unavailable_sources = [k for k, v in availability.items() if not v]
-            
-            logger.info(f"  Available: {', '.join(available_sources) if available_sources else 'None'}")
-            logger.info(f"  Unavailable: {', '.join(unavailable_sources) if unavailable_sources else 'None'}")
-        
-        # Save exploration results
-        exploration_file = self.config.output_dir / "data_exploration.json"
-        
-        if save_json(exploration_results, exploration_file):
-            logger.info(f"Exploration results saved to {exploration_file}")
+        logger.info("Exploring hydro data structure...")
+
+        camels_us_dir = self.data_root / "camels" / "camels_us"
+
+        if camels_us_dir.exists():
+            logger.info(f"Found CAMELS directory: {camels_us_dir}")
+
+            txt_files = list(camels_us_dir.glob("camels_*.txt"))
+            logger.info(f"Attribute files found: {len(txt_files)}")
+            for f in txt_files[:5]:
+                logger.info(f"  - {f.name}")
+
+            streamflow_dirs = [
+                camels_us_dir / "camels_streamflow",
+                camels_us_dir / "basin_timeseries_v1p2_metForcing_obsFlow" /
+                "basin_dataset_public_v1p2" / "usgs_streamflow"
+            ]
+
+            for dir_path in streamflow_dirs:
+                if dir_path.exists():
+                    subdirs = [d for d in dir_path.iterdir() if d.is_dir()]
+                    logger.info(f"Found streamflow directory: {dir_path}")
+                    logger.info(f"  Subdirectories (HUC2): {len(subdirs)}")
+                    if subdirs:
+                        logger.info(f"  First few: {[d.name for d in subdirs[:5]]}")
+                else:
+                    logger.debug(f"Directory not found: {dir_path}")
         else:
-            logger.warning("Failed to save exploration results")
+            logger.error(f"CAMELS directory not found: {camels_us_dir}")
+
+        for name, config in self.config.data_sources.items():
+            if name not in ["attributes", "camels_streamflow"]:
+                if config.data_source_path.exists():
+                    logger.info(f"Found {name} directory: {config.data_source_path}")
+                else:
+                    logger.debug(f"{name} directory not found: {config.data_source_path}")
