@@ -28,3 +28,4 @@ logs/
 .vscode-server/
 output/
 *.nc
+output/
