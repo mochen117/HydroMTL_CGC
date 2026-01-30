@@ -61,12 +61,12 @@ class AttributeLoader(BaseDataLoader):
             try:
                 attr_df = self._load_attribute_file(attr_type, filename)
                 if attr_df is not None and not attr_df.empty:
-                    merged_df = pd.merge(merged_df, attr_df, on="gauge_id", how="left")
+                    merged_df = pd.merge(merged_df, attr_df, on="gage_id", how="left")
                     logger.debug(f"Merged {attr_type} attributes: {len(attr_df)} basins")
             except Exception as e:
                 logger.error(f"Failed to load {attr_type} from {filename}: {e}")
 
-        valid_mask = merged_df['gauge_id'].apply(self.huc_mapper.validate_basin)
+        valid_mask = merged_df['gage_id'].apply(self.huc_mapper.validate_basin)
         invalid_count = (~valid_mask).sum()
 
         if invalid_count > 0:
@@ -75,7 +75,7 @@ class AttributeLoader(BaseDataLoader):
 
         if 'huc_02' not in merged_df.columns:
             logger.debug("huc_02 column not found in attributes")
-            merged_df['huc_02'] = merged_df['gauge_id'].apply(
+            merged_df['huc_02'] = merged_df['gage_id'].apply(
                 lambda x: str(x)[:2] if len(str(x)) >= 2 else '01'
             )
         
@@ -84,9 +84,9 @@ class AttributeLoader(BaseDataLoader):
         huc_mapping = self._extract_huc_from_camels_name()
         if huc_mapping is not None and not huc_mapping.empty:
             for idx, row in merged_df.iterrows():
-                gauge_id = row['gauge_id']
-                if gauge_id in huc_mapping.index:
-                    merged_df.at[idx, 'huc_02'] = huc_mapping.loc[gauge_id]
+                gage_id = row['gage_id']
+                if gage_id in huc_mapping.index:
+                    merged_df.at[idx, 'huc_02'] = huc_mapping.loc[gage_id]
 
         if max_basins and max_basins < len(merged_df):
             merged_df = merged_df.head(max_basins)
@@ -117,11 +117,16 @@ class AttributeLoader(BaseDataLoader):
         try:
             df = pd.read_csv(file_path, delimiter=';')
 
-            if 'gauge_id' not in df.columns:
-                logger.error(f"No gauge_id column in {filename}")
+            # Fix column naming inconsistency: CAMELS files use gauge_id, code uses gage_id
+            if 'gauge_id' in df.columns and 'gage_id' not in df.columns:
+                df = df.rename(columns={'gauge_id': 'gage_id'})
+                logger.debug(f"Renamed 'gauge_id' column to 'gage_id' in {filename}")
+
+            if 'gage_id' not in df.columns:
+                logger.error(f"No gage_id column in {filename}")
                 return None
 
-            df['gauge_id'] = df['gauge_id'].astype(str).str.strip()
+            df['gage_id'] = df['gage_id'].astype(str).str.strip()
 
             return df
 
@@ -143,13 +148,18 @@ class AttributeLoader(BaseDataLoader):
                     name_df = pd.read_csv(name_file_path, delimiter=';')
                     logger.info(f"Loaded camels_name.txt from {name_file_path}")
                     
+                    # Fix column naming inconsistency
+                    if 'gauge_id' in name_df.columns and 'gage_id' not in name_df.columns:
+                        name_df = name_df.rename(columns={'gauge_id': 'gage_id'})
+                        logger.debug("Renamed 'gauge_id' column to 'gage_id' in camels_name.txt")
+                    
                     if 'huc_02' not in name_df.columns:
                         logger.debug("camels_name.txt does not contain huc_02 column")
                         return None
                         
                     huc_series = pd.Series(
                         name_df['huc_02'].values, 
-                        index=name_df['gauge_id'].astype(str).str.strip()
+                        index=name_df['gage_id'].astype(str).str.strip()
                     )
                     huc_series = huc_series.astype(str).str.zfill(2)
                     
@@ -162,15 +172,15 @@ class AttributeLoader(BaseDataLoader):
         logger.debug("camels_name.txt not found in any expected location")
         return None
 
-    def get_basin_attributes(self, gauge_id: str) -> Dict[str, Any]:
-        """Get all attributes for a specific gauge."""
+    def get_basin_attributes(self, gage_id: str) -> Dict[str, Any]:
+        """Get all attributes for a specific gage."""
         if not self.data or self.data.empty:
             logger.warning("Attributes not loaded yet")
             return {}
 
-        gauge_row = self.data[self.data['gauge_id'] == gauge_id]
-        if gauge_row.empty:
-            logger.warning(f"No attributes found for gauge {gauge_id}")
+        gage_row = self.data[self.data['gage_id'] == gage_id]
+        if gage_row.empty:
+            logger.warning(f"No attributes found for gage {gage_id}")
             return {}
 
-        return gauge_row.iloc[0].to_dict()
+        return gage_row.iloc[0].to_dict()

@@ -161,47 +161,62 @@ class ProjectConfig:
 
     def _init_default_data_sources(self):
         """Initialize default data source configurations."""
-        camels_us_dir = self.data_root / "camels" / "camels_us"
+        # Use the data_root directly for flexibility
+        data_root = self.data_root
 
         self.data_sources = {
             "attributes": DataSourceConfig(
                 name="basin_attributes",
-                data_source_path=camels_us_dir,
+                data_source_path=data_root / "camels" / "camels_us",
                 file_pattern="camels_name.txt",
                 delimiter=";",
                 description="CAMELS basin attributes and HUC2 mapping"),
+            
             "camels_streamflow": DataSourceConfig(
                 name="camels_streamflow",
-                data_source_path=camels_us_dir /
-                "basin_timeseries_v1p2_metForcing_obsFlow" /
-                "basin_dataset_public_v1p2" /
-                "usgs_streamflow",
+                data_source_path=data_root / "camels" / "camels_us" / 
+                                  "basin_timeseries_v1p2_metForcing_obsFlow" /
+                                  "basin_dataset_public_v1p2" / "camels_streamflow",
                 file_pattern="{gauge_id}_streamflow_qc.txt",
                 subdirectory="{huc2}",
-                description="CAMELS USGS streamflow data"),
+                delimiter=r'\s+',  # Whitespace delimiter for CAMELS data
+                description="CAMELS USGS streamflow data (1980-2014)"),
+            
+            "usgs_streamflow": DataSourceConfig(
+                name="usgs_streamflow",
+                data_source_path=data_root / "camels" / "camels_us" / "usgs_streamflow",
+                file_pattern="{gauge_id}_streamflow_qc.txt",
+                subdirectory="{huc2}",
+                delimiter=',',  # Comma delimiter for USGS data
+                required=False,  # Optional for backward compatibility
+                description="USGS streamflow data (2015-2021)"),
+            
             "nldas_forcing": DataSourceConfig(
                 name="nldas_forcing",
-                data_source_path=self.data_root /
-                "nldas4camels",
+                data_source_path=data_root / "nldas4camels",
                 file_pattern="{gauge_id}_lump_nldas_forcing_leap.txt",
                 subdirectory="basin_mean_forcing/{huc2}",
+                delimiter=r'\s+',
                 description="NLDAS meteorological forcing data"),
+            
             "et_data": DataSourceConfig(
                 name="modis_et",
-                data_source_path=self.data_root /
-                "modiset4camels",
+                data_source_path=data_root / "modiset4camels",
                 file_pattern="{gauge_id}_lump_modis16a2v006_et.txt",
                 subdirectory="basin_mean_forcing/MOD16A2_006_CAMELS/{huc2}",
+                delimiter=r'\s+',
                 required=False,
                 description="MODIS ET data (optional)"),
+            
             "smap_data": DataSourceConfig(
                 name="smap_soil_moisture",
-                data_source_path=self.data_root /
-                "smap4camels",
+                data_source_path=data_root / "smap4camels",
                 file_pattern="{gauge_id}_lump_nasa_usda_smap.txt",
                 subdirectory="NASA_USDA_SMAP_CAMELS/{huc2}",
+                delimiter=r'\s+',
                 required=False,
-                description="SMAP soil moisture data (optional)")}
+                description="SMAP soil moisture data (optional)")
+        }
 
         logger.debug(f"Initialized {len(self.data_sources)} data sources")
 

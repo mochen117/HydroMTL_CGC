@@ -3,6 +3,7 @@ Batch processor for handling multiple basins.
 """
 
 import pandas as pd
+import numpy as np
 from pathlib import Path
 from typing import List, Dict, Optional, Any, Tuple
 import logging
