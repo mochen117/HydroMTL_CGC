@@ -1,3 +1,8 @@
+"""
+SMAP soil moisture data loader.
+Modified to load only ssm variable for model evaluation as per paper requirements.
+"""
+
 import pandas as pd
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -12,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 class SMAPLoader(BaseDataLoader):
-    """Loader for soil moisture data."""
+    """Loader for soil moisture data for model evaluation only."""
 
     def __init__(self, config: DataSourceConfig):
         super().__init__(config, "smap")
@@ -20,8 +25,8 @@ class SMAPLoader(BaseDataLoader):
 
     def load(self, gage_ids: List[str], **kwargs) -> pd.DataFrame:
         """
-        Load SMAP data for specified gauges.
-
+        Load SMAP data for specified gauges for model evaluation only.
+        
         Args:
             gage_ids: List of gage IDs to load (8-digit format, e.g., "01013500")
             **kwargs: Additional parameters including:
@@ -30,7 +35,7 @@ class SMAPLoader(BaseDataLoader):
                 - end_date: End date for filtering (optional)
 
         Returns:
-            DataFrame with SMAP data (no interpolation for missing values)
+            DataFrame with SMAP ssm data only, no interpolation for missing values
         """
         if not gage_ids:
             logger.warning("No gage IDs provided")
@@ -42,6 +47,8 @@ class SMAPLoader(BaseDataLoader):
             try:
                 gage_data = self._load_single_gauge(gage_id, **kwargs)
                 if gage_data is not None and not gage_data.empty:
+                    # Filter to only ssm variable as per paper requirements
+                    gage_data = self._filter_to_ssm_only(gage_data)
                     all_data.append(gage_data)
                     logger.debug(f"Loaded SMAP data for gage {gage_id}")
                 else:
@@ -64,6 +71,23 @@ class SMAPLoader(BaseDataLoader):
         # Store and return
         self.data = combined_df
         return combined_df
+
+    def _filter_to_ssm_only(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Filter DataFrame to only include ssm variable as per paper requirements."""
+        if df.empty:
+            return df
+        
+        # Keep only date, gage_id, and ssm columns
+        keep_cols = ['date', 'gage_id']
+        if 'ssm' in df.columns:
+            keep_cols.append('ssm')
+        else:
+            logger.warning("ssm column not found in SMAP data")
+            df['ssm'] = np.nan
+        
+        # Drop all other columns
+        df = df[keep_cols]
+        return df
 
     def _load_single_gauge(self, gage_id: str, **kwargs) -> Optional[pd.DataFrame]:
         """Load SMAP data for a single gage."""
@@ -144,23 +168,22 @@ class SMAPLoader(BaseDataLoader):
         return None
 
     def _read_and_process_file(self, file_path: Path, gage_id: str) -> pd.DataFrame:
-        """Read and process SMAP data file."""
+        """Read and process SMAP data file - only ssm variable as per paper."""
         try:
             # Read SMAP data (comma-separated with header)
             df = pd.read_csv(file_path, sep=',', header=0)
 
-            # Standardize column names
-            df = df.rename(columns={
+            # Standardize column names - only keep ssm as per paper requirements
+            column_mapping = {
                 'Year': 'year',
                 'Mnth': 'month',
                 'Day': 'day',
                 'Hr': 'hour',
-                'ssm(mm)': 'ssm',
-                'susm(mm)': 'susm',
-                'smp(-)': 'smp',
-                'ssma(-)': 'ssma',
-                'susma(-)': 'susma'
-            })
+                'ssm(mm)': 'ssm'  # Only ssm is used for model evaluation
+                # Note: Following paper requirements, we ignore susm, smp, ssma, susma
+            }
+            
+            df = df.rename(columns=column_mapping)
 
             # Convert numeric columns
             df['year'] = df['year'].astype(int)
@@ -170,11 +193,12 @@ class SMAPLoader(BaseDataLoader):
             # Create date column
             df['date'] = pd.to_datetime(df[['year', 'month', 'day']])
 
-            # Convert data columns to numeric
-            numeric_cols = ['ssm', 'susm', 'smp', 'ssma', 'susma']
-            for col in numeric_cols:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
+            # Convert ssm column to numeric
+            if 'ssm' in df.columns:
+                df['ssm'] = pd.to_numeric(df['ssm'], errors='coerce')
+            else:
+                logger.warning(f"ssm column not found in {file_path}")
+                df['ssm'] = np.nan
 
             # Add gage_id (original 8-digit format)
             df['gage_id'] = gage_id
@@ -184,8 +208,8 @@ class SMAPLoader(BaseDataLoader):
             cols_to_drop = [col for col in cols_to_drop if col in df.columns]
             df = df.drop(columns=cols_to_drop)
 
-            # Reorder columns
-            col_order = ['date', 'gage_id'] + [c for c in df.columns if c not in ['date', 'gage_id']]
+            # Reorder columns - only date, gage_id, ssm
+            col_order = ['date', 'gage_id', 'ssm']
             df = df[col_order]
 
             logger.debug(f"Loaded SMAP data from {file_path}: {len(df)} records")
@@ -223,14 +247,7 @@ class SMAPLoader(BaseDataLoader):
                 column_mapping[col] = 'hour'
             elif 'ssm' in col_lower:
                 column_mapping[col] = 'ssm'
-            elif 'susm' in col_lower:
-                column_mapping[col] = 'susm'
-            elif 'smp' in col_lower:
-                column_mapping[col] = 'smp'
-            elif 'ssma' in col_lower:
-                column_mapping[col] = 'ssma'
-            elif 'susma' in col_lower:
-                column_mapping[col] = 'susma'
+            # Note: We ignore other SMAP variables as per paper requirements
         
         df = df.rename(columns=column_mapping)
         
@@ -240,18 +257,20 @@ class SMAPLoader(BaseDataLoader):
         df['day'] = df['day'].astype(int)
         df['date'] = pd.to_datetime(df[['year', 'month', 'day']])
         
-        numeric_cols = ['ssm', 'susm', 'smp', 'ssma', 'susma']
-        for col in numeric_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
+        if 'ssm' in df.columns:
+            df['ssm'] = pd.to_numeric(df['ssm'], errors='coerce')
+        else:
+            df['ssm'] = np.nan
         
         df['gage_id'] = gage_id
         
+        # Drop unnecessary columns
         cols_to_drop = ['year', 'month', 'day', 'hour']
         cols_to_drop = [col for col in cols_to_drop if col in df.columns]
         df = df.drop(columns=cols_to_drop)
         
-        col_order = ['date', 'gage_id'] + [c for c in df.columns if c not in ['date', 'gage_id']]
+        # Reorder columns - only date, gage_id, ssm
+        col_order = ['date', 'gage_id', 'ssm']
         df = df[col_order]
         
         return df

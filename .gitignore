@@ -1,31 +1,58 @@
 # Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
 
-# 环境
+# Environment
 .env
+.venv
+env/
 venv/
+ENV/
 
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
 
-# 数据文件（绝对不要推送！）
+# Data files
 ../../hydro_data/
 *.npy
+*.npz
 *.pkl
+*.pickle
 *.h5
+*.hdf5
 
-# 复现代码（不要推送）
+# Reproduction code
 ../HydroMTL/
 
-# 日志
+# Logs
 *.log
 logs/
+log/
 
-# 系统文件
+# System files
 .cache/
 .vscode-server/
+.DS_Store
+
+# Output directories
 output/
+output_591_basins/
 *.nc
-output/
+
+# Jupyter
+.ipynb_checkpoints
+
+# Temporary files
+*.tmp
+*.temp
+
+# Project specific
+model_checkpoints/
+experiments/
+results/

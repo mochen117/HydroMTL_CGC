@@ -1,6 +1,7 @@
 """
 Forcing data loader for NLDAS dataset.
 Fixed to handle CAMELS forcing format with year, month, day columns.
+Modified to load only 5 required meteorological forcing variables from paper Table 1.
 """
 
 import pandas as pd
@@ -16,6 +17,15 @@ logger = logging.getLogger(__name__)
 
 class ForcingLoader:
     """Loader for NLDAS forcing data from CAMELS dataset."""
+
+    # Required forcing variables according to paper Table 1
+    REQUIRED_VARIABLES = [
+        'total_precipitation',
+        'temperature', 
+        'specific_humidity',
+        'shortwave_radiation',
+        'potential_energy'
+    ]
 
     def __init__(self, config: DataSourceConfig):
         self.config = config
@@ -43,6 +53,8 @@ class ForcingLoader:
                 
                 gage_data = self._load_single_gage(gage_id, huc2)
                 if gage_data is not None and not gage_data.empty:
+                    # Ensure all required variables are present
+                    gage_data = self._ensure_required_variables(gage_data)
                     all_data.append(gage_data)
                     successful_gages.append(gage_id)
             except Exception as e:
@@ -54,7 +66,22 @@ class ForcingLoader:
             return None
 
         logger.info(f"Loaded forcing for {len(successful_gages)} gages")
-        return pd.concat(all_data, ignore_index=True)
+        combined_df = pd.concat(all_data, ignore_index=True)
+        
+        # Check for missing required variables
+        missing_vars = [var for var in self.REQUIRED_VARIABLES if var not in combined_df.columns]
+        if missing_vars:
+            logger.warning(f"Missing required forcing variables: {missing_vars}")
+        
+        return combined_df
+
+    def _ensure_required_variables(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Ensure all required forcing variables are present."""
+        for var in self.REQUIRED_VARIABLES:
+            if var not in df.columns:
+                logger.warning(f"Required forcing variable {var} not found, filling with NaN")
+                df[var] = np.nan
+        return df
 
     def _load_single_gage(self, gage_id: str, huc2: str) -> Optional[pd.DataFrame]:
         """Load forcing data for a single gage."""
@@ -138,7 +165,7 @@ class ForcingLoader:
         return None
 
     def _read_forcing_file(self, file_path: Path, gage_id: str) -> pd.DataFrame:
-        """Read and parse a NLDAS forcing file."""
+        """Read and parse a NLDAS forcing file with only paper-required variables."""
         logger.debug(f"Reading forcing file: {file_path}")
         
         try:
@@ -154,23 +181,20 @@ class ForcingLoader:
                 df = pd.read_csv(file_path, sep=r'\s+', header=0)
                 logger.debug(f"Forcing file has header with columns: {df.columns.tolist()}")
                 
-                # Standard column name mapping for NLDAS forcing data
+                # Standard column name mapping for NLDAS forcing data - only paper-required variables
                 column_mapping = {
                     'Year': 'year',
                     'Mnth': 'month', 
                     'Day': 'day',
                     'Hr': 'hour',
+                    'total_precipitation(kg/m^2)': 'total_precipitation',
                     'temperature(C)': 'temperature',
                     'specific_humidity(kg/kg)': 'specific_humidity',
-                    'pressure(Pa)': 'pressure',
-                    'wind_u(m/s)': 'wind_u',
-                    'wind_v(m/s)': 'wind_v',
-                    'longwave_radiation(W/m^2)': 'longwave_radiation',
-                    'convective_fraction(-)': 'convective_fraction',
                     'shortwave_radiation(W/m^2)': 'shortwave_radiation',
-                    'potential_energy(J/kg)': 'potential_energy',
-                    'potential_evaporation(kg/m^2)': 'potential_evaporation',
-                    'total_precipitation(kg/m^2)': 'total_precipitation'
+                    'potential_energy(J/kg)': 'potential_energy'
+                    # Note: Following paper Table 1, we only load these 5 variables
+                    # Removed: 'pressure(Pa)', 'wind_u(m/s)', 'wind_v(m/s)', 
+                    # 'longwave_radiation(W/m^2)', 'convective_fraction(-)'
                 }
                 
                 # Rename columns
@@ -240,7 +264,7 @@ class ForcingLoader:
         df['date'] = pd.to_datetime(df[['year', 'month', 'day']], errors='coerce')
         df = df.dropna(subset=['date'])
         
-        # Convert other columns to numeric
+        # Convert other columns to numeric - only paper-required variables
         for col in df.columns:
             if col not in ['year', 'month', 'day', 'date', 'gage_id', 'hour']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
@@ -253,9 +277,10 @@ class ForcingLoader:
         cols_to_drop = [col for col in cols_to_drop if col in df.columns]
         df = df.drop(columns=cols_to_drop)
         
-        # Reorder columns, put gage_id as second column
-        cols = ['date', 'gage_id'] + [c for c in df.columns if c not in ['date', 'gage_id']]
-        df = df[cols]
+        # Filter to only paper-required variables
+        # Keep only the 5 required variables plus date and gage_id
+        required_cols = ['date', 'gage_id'] + [var for var in self.REQUIRED_VARIABLES if var in df.columns]
+        df = df[required_cols]
         
         # Sort by date
         df = df.sort_values('date').reset_index(drop=True)

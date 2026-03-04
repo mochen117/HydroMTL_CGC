@@ -6,6 +6,7 @@ channels:
   - defaults
 dependencies:
   - python=3.10
+  - pandas=2.1.*           
   - numpy=1.24.*          
   - mkl=2024.*       
   - mkl-service=2.4.*
@@ -15,7 +16,8 @@ dependencies:
   - seaborn=0.13.*
   - scikit-learn=1.4.*  
   - tqdm=4.66.*
-  - hydroerr
+  - netcdf4=1.7.*  
+  - h5netcdf=1.3.*       
   - pytorch=1.12.1
   - pytorch-scatter
   - tensorboard=2.15.*   
@@ -27,4 +29,5 @@ dependencies:
   - jupyter=1.1.*
   - pip
   - pip:
-    - tbparse>=0.0.9    
+    - tbparse>=0.0.9
+    - hydroerr           

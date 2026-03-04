@@ -92,7 +92,28 @@ class ProcessingConfig:
     overwrite_existing: bool = False
     chunk_size: int = 100
     parallel_processing: bool = True
-    max_workers: int = None
+    max_workers: Optional[int] = None
+    
+    # Add static variable configuration according to paper
+    static_variables: List[str] = field(default_factory=lambda: [
+        # Terrain attributes
+        'elev_mean', 'slope_mean', 'area_gages2',
+        # Land cover attributes
+        'frac_forest', 'lai_max', 'lai_diff', 
+        'dom_land_cover_frac', 'dom_land_cover',
+        # Soil attributes
+        'root_depth_50', 'soil_depth_statgs0', 
+        'soil_porosity', 'soil_conductivity', 'max_water_content',
+        # Geology attributes
+        'geol_class_1st', 'geol_class_2nd', 
+        'geol_porosity', 'geol_permeability'
+    ])
+    
+    # Add forcing variables configuration according to paper
+    forcing_variables: List[str] = field(default_factory=lambda: [
+        'total_precipitation', 'temperature', 'specific_humidity',
+        'shortwave_radiation', 'potential_energy'
+    ])
 
     def validate(self) -> List[str]:
         """Validate processing parameters."""
@@ -108,7 +129,7 @@ class ProcessingConfig:
         if not 0 <= self.min_streamflow_coverage <= 1:
             errors.append("min_streamflow_coverage must be between 0 and 1")
 
-        valid_formats = ["netcdf", "parquet", "csv"]
+        valid_formats = ["netcdf", "parquet", "csv", "hdf5"]
         if self.output_format not in valid_formats:
             errors.append(f"Invalid output format. Must be one of: {valid_formats}")
 
@@ -123,7 +144,7 @@ class ProjectConfig:
     version: str = "1.0.0"
     data_root: Path = field(default_factory=lambda:
                             Path(os.environ.get("HYDRO_DATA_ROOT", "./data")))
-    max_basins: int = 10
+    max_basins: Optional[int] = None
     selected_basins: List[str] = field(default_factory=list)
     data_sources: Dict[str, DataSourceConfig] = field(default_factory=dict)
     processing_config: ProcessingConfig = field(
@@ -134,6 +155,7 @@ class ProjectConfig:
 
     def __post_init__(self):
         """Initialize and validate configuration."""
+        # Convert string paths to Path objects
         if isinstance(self.data_root, str):
             self.data_root = Path(self.data_root)
         self.data_root = self.data_root.resolve()
@@ -156,6 +178,12 @@ class ProjectConfig:
             if not hasattr(source, 'name') or not source.name:
                 source.name = name
 
+        # Add logging for max_basins configuration
+        if self.max_basins is None:
+            logger.info(f"max_basins is None - will process ALL available basins")
+        else:
+            logger.info(f"max_basins is set to {self.max_basins} - will process up to {self.max_basins} basins")
+            
         logger.debug(f"Resolved data_root: {self.data_root}")
         logger.debug(f"Resolved output_dir: {self.output_dir}")
 
@@ -268,7 +296,10 @@ class ProjectConfig:
         
         data_root = data_root.resolve()
         
-        max_basins = config_dict.get('max_basins', 10)
+        # Handle max_basins parameter - directly use the value as it comes from run_pipeline.py
+        max_basins = config_dict.get('max_basins')
+        # No need for special string handling since run_pipeline.py already handles it
+        
         selected_basins = config_dict.get('selected_basins', [])
         
         # Processing config
@@ -293,7 +324,7 @@ class ProjectConfig:
             project_name=project_name,
             version=version,
             data_root=data_root,
-            max_basins=max_basins,
+            max_basins=max_basins,  # Pass the value directly
             selected_basins=selected_basins,
             processing_config=processing_config,
             output_dir=output_dir,
@@ -310,6 +341,7 @@ class ProjectConfig:
 
 
 def get_default_config() -> ProjectConfig:
+    """Get default configuration"""
     config = ProjectConfig()
 
     env_data_root = os.environ.get("HYDRO_DATA_ROOT")

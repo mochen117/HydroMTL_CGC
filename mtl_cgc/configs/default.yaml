@@ -1,0 +1,129 @@
+# Hydrological Multi-Task Learning with CGC - Default Configuration
+# Project: HydroMTL_CGC
+# Adapted to match actual netCDF variable names from output_591_basins/
+
+experiment:
+  name: "cgc_hydro_experiment_001"
+  task: "streamflow_et_prediction"
+  timestamp: null
+  save_dir: "./experiments"
+
+data:
+  # Data source - point to your actual data directory
+  dataset: "CAMELS_US_custom"
+  data_root: "./output_591_basins"
+
+  # Features configuration - exact variable names from netCDF files
+  static_features:
+    - "elev_mean"
+    - "slope_mean"
+    - "area_gages2"
+    - "frac_forest"
+    - "soil_depth_statgs0"    # renamed from soil_depth
+    - "soil_porosity"
+
+  dynamic_features:
+    - "total_precipitation"   # renamed from prcp
+    - "temperature"           # renamed from tmax/tmin (single variable)
+    - "specific_humidity"     # renamed from vp
+    - "shortwave_radiation"   # renamed from srad
+    - "potential_energy"      # renamed from pet
+
+  # Targets - exact target variable names
+  targets:
+    - name: "streamflow"
+      type: "regression"
+      loss_weight: 1.0
+      constraint: "non_negative"
+    - name: "evapotranspiration"   # renamed from et
+      type: "regression"
+      loss_weight: 0.8
+      constraint: "non_negative"
+
+  # Time series parameters
+  sequence_length: 30
+  prediction_horizon: 1
+  forecast_history: 365
+
+  # Data splits (adjust if your data does not cover these periods)
+  train_period: ["2001-10-01", "2011-10-01"]
+  val_period: ["2011-10-01", "2013-10-01"]
+  test_period: ["2013-10-01", "2016-10-01"]
+
+  # Processing
+  normalize: true
+  fill_missing: true
+  batch_size: 32
+  num_workers: 0
+
+model:
+  # CGC Architecture - unchanged
+  cgc:
+    shared_experts: 6
+    task_experts: [4, 3]
+    expert_hidden_dim: 128
+    use_attention_gate: true
+    dropout_rate: 0.2
+
+  encoder:
+    type: "cnn"
+    hidden_dim: 256
+    num_layers: 2
+    bidirectional: true
+
+  task_towers:
+    - type: "lstm"
+      hidden_dim: 128
+      num_layers: 1
+      output_head: "regression"
+    - type: "lstm"
+      hidden_dim: 128
+      num_layers: 1
+      output_head: "regression"
+
+  physics_constraints:
+    water_balance:
+      enabled: true
+      alpha: 0.1
+      requires_precipitation: true
+
+training:
+  optimizer: "adam"
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  clip_grad_norm: 1.0
+
+  loss:
+    base_loss: "mse"
+    multi_task_balancing: "uncertainty"
+    water_balance_weight: 0.1
+
+  epochs: 300
+  warmup_epochs: 10
+  patience: 30
+
+  dropout: 0.2
+  batch_norm: true
+
+  save_frequency: 10
+  save_best_only: true
+
+evaluation:
+  metrics:
+    - "nse"
+    - "kge"
+    - "rmse"
+    - "mae"
+    - "pbias"
+    - "r2"
+
+  plot_predictions: true
+  save_figures: true
+  confidence_intervals: true
+
+logging:
+  level: "INFO"
+  tensorboard: true
+  wandb: false
+  console: true
+  file: true

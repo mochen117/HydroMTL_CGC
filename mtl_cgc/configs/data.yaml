@@ -1,0 +1,36 @@
+# configs/data_config.yaml
+data:
+  sequence_length: 365
+  prediction_horizon: 1
+  batch_size: 32
+  num_workers: 4
+  train_ratio: 0.7
+  val_ratio: 0.15
+  normalize: true
+  
+  # Dynamic features (time-varying)
+  dynamic_features:
+    - total_precipitation
+    - temperature
+    - specific_humidity
+    - shortwave_radiation
+    - potential_energy
+  
+  # Static features (basin characteristics)
+  static_features:
+    - elev_mean
+    - slope_mean
+    - area_gages2
+    - frac_forest
+    - lai_max
+    - lai_diff
+    - soil_porosity
+    - soil_conductivity
+    - max_water_content
+    - geol_porosity
+    - geol_permeability
+  
+  # Target variables for multi-task learning
+  target_features:
+    - streamflow
+    - evapotranspiration

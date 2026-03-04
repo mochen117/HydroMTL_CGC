@@ -1,0 +1,64 @@
+# config.yaml
+project_name: "HydroMTL_CGC"
+
+# Data root directory - can be overridden by command line
+data_root: "/home/mochen/hydro_data"
+
+# Maximum basins: null means process all
+max_basins: null
+
+# Output directory - can be overridden by command line
+output_dir: "./output_all_basins"
+
+# Processing configuration
+processing_config:
+  start_date: "2001-01-01"
+  end_date: "2021-09-30"
+  min_streamflow_coverage: 0.95
+  output_format: "netcdf"
+  overwrite_existing: false
+
+# Data source configuration
+data_sources:
+  attributes:
+    name: "attributes"
+    data_source_path: "camels/camels_us"
+    file_patterns:
+      - "camels_name.txt"
+      - "camels_hydro.txt"
+      - "camels_clim.txt"
+      - "camels_topo.txt"
+      - "camels_soil.txt"
+      - "camels_vege.txt"
+      - "camels_geol.txt"
+  
+  camels_streamflow:
+    name: "camels_streamflow"
+    data_source_path: "camels/camels_us/basin_timeseries_v1p2_metForcing_obsFlow/basin_dataset_public_v1p2/camels_streamflow"
+    file_pattern: "{huc2}/{gage_id}_streamflow_qc.txt"
+  
+  usgs_streamflow:
+    name: "usgs_streamflow"
+    data_source_path: "camels/camels_us/usgs_streamflow"
+    file_pattern: "{huc2}/{gage_id}_streamflow_qc.txt"
+  
+  nldas_forcing:
+    name: "nldas_forcing"
+    data_source_path: "nldas4camels"
+    file_pattern: "basin_mean_forcing/{huc2}/{gage_id}_lump_nldas_forcing_leap.txt"
+  
+  et_data:
+    name: "et_data"
+    data_source_path: "modiset4camels"
+    file_pattern: "basin_mean_forcing/MOD16A2_006_CAMELS/{huc2}/{gage_id}_lump_modis16a2v006_et.txt"
+  
+  smap_data:
+    name: "smap_data"
+    data_source_path: "smap4camels"
+    file_pattern: "NASA_USDA_SMAP_CAMELS/{huc2}/{gage_id}_lump_nasa_usda_smap.txt"
+
+# Logging configuration
+logging:
+  level: "INFO"
+  file: "hydro_pipeline.log"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

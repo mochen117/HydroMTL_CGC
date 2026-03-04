@@ -7,11 +7,11 @@ import sys
 import argparse
 import logging
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List
 import traceback
 
 # Add project root to path
-PROJECT_ROOT = Path(__file__).parent
+PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 # Import custom logging
@@ -74,55 +74,37 @@ def load_basin_list(file_path: Optional[Path]) -> Optional[List[str]]:
         return None
 
 
-def print_config_summary(config: Dict[str, Any]) -> None:
-    """Print configuration summary in a clean format."""
-    logging.info("\nConfiguration Summary:")
-    logging.info("-" * 30)
-    
-    for key, value in config.items():
-        if key == 'selected_basins' and value:
-            logging.info(f"{key:20} {len(value)} basins specified")
-        elif key == 'selected_basins':
-            logging.info(f"{key:20} Not specified")
-        elif isinstance(value, Path):
-            logging.info(f"{key:20} {value}")
-        elif isinstance(value, list):
-            logging.info(f"{key:20} {len(value)} items")
-        else:
-            logging.info(f"{key:20} {value}")
-
-
 def main():
     """Main pipeline function."""
     parser = argparse.ArgumentParser(
-        description='Hydro Data Processing Pipeline'
+        description='Hydro Data Processing Pipeline - Process CAMELS data with multiple sources'
     )
     
     # Required arguments
-    parser.add_argument('--data-root', required=True, type=Path,
+    parser.add_argument('--data-root', type=Path, required=True,
                        help='Root directory containing hydrological data')
     
     # Optional arguments
     parser.add_argument('--max-basins', type=int, default=None,
-                       help='Maximum number of basins to process')
+                       help='Maximum number of basins to process (None=all)')
     
     parser.add_argument('--basin-list', type=Path,
                        help='File containing list of basin IDs (one per line)')
     
     parser.add_argument('--output-dir', type=Path, default=Path('./output'),
-                       help='Output directory for processed data')
+                       help='Output directory for processed data (default: ./output)')
     
     parser.add_argument('--start-date', default='2001-01-01',
-                       help='Start date for data processing (YYYY-MM-DD)')
+                       help='Start date for data processing (YYYY-MM-DD, default: 2001-01-01)')
     
     parser.add_argument('--end-date', default='2021-09-30',
-                       help='End date for data processing (YYYY-MM-DD)')
+                       help='End date for data processing (YYYY-MM-DD, default: 2021-09-30)')
     
     parser.add_argument('--min-coverage', type=float, default=0.95,
-                       help='Minimum streamflow data coverage (0.0-1.0)')
+                       help='Minimum streamflow data coverage (0.0-1.0, default: 0.95)')
     
     parser.add_argument('--output-format', choices=['netcdf', 'parquet', 'hdf5'], 
-                       default='netcdf', help='Output file format')
+                       default='netcdf', help='Output file format (default: netcdf)')
     
     # Mode flags
     parser.add_argument('--explore-only', action='store_true',
@@ -140,6 +122,30 @@ def main():
     parser.add_argument('--test-basin', type=str,
                        help='Test processing for a single basin ID')
     
+    # Update help information to reflect default behavior of max_basins
+    parser.epilog = """
+Examples:
+  # Process all basins with default settings
+  python %(prog)s --data-root /path/to/data
+  
+  # Process only 50 basins
+  python %(prog)s --data-root /path/to/data --max-basins 50
+  
+  # Process basins from a list file
+  python %(prog)s --data-root /path/to/data --basin-list basins.txt
+  
+  # Test a single basin
+  python %(prog)s --data-root /path/to/data --test-basin 01013500
+  
+  # Dry run to see what would be processed
+  python %(prog)s --data-root /path/to/data --dry-run
+  
+  # Explore data structure
+  python %(prog)s --data-root /path/to/data --explore-only
+  
+Note: When --max-basins is not specified, ALL available basins will be processed.
+"""
+    
     args = parser.parse_args()
     
     # Setup logging first
@@ -148,24 +154,16 @@ def main():
     
     log_section("HYDRO DATA PROCESSING PIPELINE", logger)
     
-    # Test single basin mode
-    if args.test_basin:
-        logger.info(f"Testing single basin: {args.test_basin}")
-    
     # Validate data directory
     if not validate_data_directory(args.data_root):
         sys.exit(1)
     
-    # Load basin list if provided
-    selected_basins = None
-    if args.basin_list:
-        selected_basins = load_basin_list(args.basin_list)
-        if selected_basins:
-            logger.info(f"Loaded {len(selected_basins)} basins from {args.basin_list}")
-    
-    # Test single basin mode
+    # Parse selected basins if provided
+    selected_basins = []
     if args.test_basin:
         selected_basins = [args.test_basin]
+    elif args.basin_list:
+        selected_basins = load_basin_list(args.basin_list)
     
     try:
         # Create processing configuration
@@ -177,32 +175,32 @@ def main():
             overwrite_existing=args.overwrite
         )
         
-        # Create project configuration directly
+        # Create project configuration
         config = ProjectConfig(
             data_root=args.data_root,
             output_dir=args.output_dir,
-            max_basins=args.max_basins if args.max_basins else 10,
-            selected_basins=selected_basins if selected_basins else [],
+            max_basins=args.max_basins,
+            selected_basins=selected_basins,
             processing_config=processing_config
         )
         
         # Ensure output directory exists
-        args.output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir = config.output_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
         
         # Print configuration summary
-        config_summary = {
-            'Data root': str(config.data_root),
-            'Output directory': str(config.output_dir),
-            'Start date': config.processing_config.start_date,
-            'End date': config.processing_config.end_date,
-            'Min coverage': config.processing_config.min_streamflow_coverage,
-            'Output format': config.processing_config.output_format,
-            'Max basins': config.max_basins,
-            'Selected basins': selected_basins,
-            'Overwrite existing': config.processing_config.overwrite_existing
-        }
-        
-        print_config_summary(config_summary)
+        logger.info("\nConfiguration Summary:")
+        logger.info("-" * 50)
+        logger.info(f"Data root                 {config.data_root}")
+        logger.info(f"Output directory          {config.output_dir}")
+        logger.info(f"Max basins                {'ALL' if config.max_basins is None else config.max_basins}")
+        logger.info(f"Selected basins count     {len(config.selected_basins)} specified" if config.selected_basins else "Selected basins count     Not specified")
+        logger.info(f"Start date                {config.processing_config.start_date}")
+        logger.info(f"End date                  {config.processing_config.end_date}")
+        logger.info(f"Min coverage              {config.processing_config.min_streamflow_coverage:.0%}")
+        logger.info(f"Output format             {config.processing_config.output_format}")
+        logger.info(f"Overwrite existing        {config.processing_config.overwrite_existing}")
+        logger.info(f"Verbose logging           {'Enabled' if args.verbose else 'Disabled'}")
         
         # Initialize pipeline
         log_section("INITIALIZING PIPELINE", logger)
