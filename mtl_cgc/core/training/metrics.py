@@ -3,13 +3,16 @@ import numpy as np
 from typing import Dict, List, Optional, Union, Tuple
 import torch.nn.functional as F
 
+# Minimum number of valid samples required to compute metrics
+MIN_SAMPLES = 10
+
 
 def compute_metrics(predictions: Dict[str, Union[torch.Tensor, Dict]],
                     targets: Dict[str, torch.Tensor],
                     metric_list: Optional[List[str]] = None) -> Dict[str, float]:
     """
     Compute evaluation metrics for multi-task hydrological predictions.
-    Supports tasks: 'streamflow', 'et' (evapotranspiration)
+    Supports tasks: 'streamflow', 'evapotranspiration'
     Supports metrics: 'nse', 'kge', 'rmse', 'mae', 'correlation', 'bias'
 
     Args:
@@ -138,8 +141,8 @@ def _calculate_task_metrics(predictions: torch.Tensor,
 
     # Handle NaN values
     mask = ~torch.isnan(target_flat)
-    if mask.sum() == 0:
-        # All targets are NaN, return NaN metrics
+    if mask.sum() < MIN_SAMPLES:
+        # Too few valid samples to compute reliable metrics
         for metric_name in metric_list:
             metrics[f'{task_name}_{metric_name}'] = float('nan')
         return metrics
@@ -158,6 +161,10 @@ def _calculate_task_metrics(predictions: torch.Tensor,
         # Convert to Python float if it's a tensor
         if torch.is_tensor(metric_value):
             metric_value = metric_value.item()
+
+        # Clip extremely negative NSE/R2 to a reasonable lower bound (optional)
+        if metric_name.lower() in ['nse', 'r2'] and metric_value < -1000:
+            metric_value = float('nan')
 
         metrics[f'{task_name}_{metric_name}'] = metric_value
 
@@ -182,7 +189,10 @@ def _calculate_global_metrics(predictions: torch.Tensor,
 
     # Handle NaN values
     mask = ~torch.isnan(targets)
-    if mask.sum() == 0:
+    if mask.sum() < MIN_SAMPLES:
+        # Return NaN-filled dictionary when insufficient samples
+        for metric_name in metric_list:
+            metrics[f'global_{metric_name}'] = float('nan')
         return metrics
 
     pred_valid = predictions[mask]
@@ -198,6 +208,10 @@ def _calculate_global_metrics(predictions: torch.Tensor,
 
         if torch.is_tensor(metric_value):
             metric_value = metric_value.item()
+
+        # Clip extremely negative NSE/R2 to NaN
+        if metric_name.lower() in ['nse', 'r2'] and metric_value < -1000:
+            metric_value = float('nan')
 
         metrics[f'global_{metric_name}'] = metric_value
 
@@ -215,7 +229,6 @@ def _calculate_nse(predictions: torch.Tensor, targets: torch.Tensor, epsilon: fl
 
 def _calculate_kge(predictions: torch.Tensor, targets: torch.Tensor, epsilon: float = 1e-8) -> torch.Tensor:
     """Calculate Kling-Gupta Efficiency."""
-    # Pearson correlation (r)
     pred_mean = torch.mean(predictions)
     target_mean = torch.mean(targets)
 
@@ -228,13 +241,9 @@ def _calculate_kge(predictions: torch.Tensor, targets: torch.Tensor, epsilon: fl
 
     r = covariance / (pred_std * target_std + epsilon)
 
-    # Variability ratio (alpha)
     alpha = pred_std / (target_std + epsilon)
-
-    # Bias ratio (beta)
     beta = pred_mean / (target_mean + epsilon)
 
-    # KGE
     kge = 1 - torch.sqrt((r - 1) ** 2 + (alpha - 1) ** 2 + (beta - 1) ** 2)
     return kge
 

@@ -4,15 +4,13 @@ Handles multiple basins, multiple tasks, and temporal sequences
 """
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 import xarray as xr
 import numpy as np
-import pandas as pd
-from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 import logging
 from sklearn.preprocessing import StandardScaler
-import pickle
+from tqdm import tqdm
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -47,7 +45,12 @@ class HydroBasinDataset(Dataset):
             static_features: List of static feature names
             target_features: List of target feature names
             normalize: Whether to normalize features
-            scalers: Pre-trained scalers for normalization
+            scalers: Pre-trained scalers for normalization. Expected format:
+                     {'dynamic': StandardScaler,
+                      'static': StandardScaler,
+                      'targets': List[StandardScaler]} where the list length equals
+                     number of target features. If None and normalize=True,
+                     scalers will be fitted on the entire dataset (not recommended).
         """
         self.nc_file = nc_file
         self.basin_id = basin_id
@@ -55,73 +58,91 @@ class HydroBasinDataset(Dataset):
         self.prediction_horizon = prediction_horizon
         self.normalize = normalize
 
-        # Default feature lists based on your NC file
         if dynamic_features is None:
             self.dynamic_features = [
-                'total_precipitation',  # mm/day
-                'temperature',          # degree_C
-                'specific_humidity',    # kg/kg
-                'shortwave_radiation',  # W/m^2
-                'potential_energy'      # J/kg
+                'total_precipitation',
+                'temperature',
+                'specific_humidity',
+                'shortwave_radiation',
+                'potential_energy'
             ]
         else:
             self.dynamic_features = dynamic_features
 
         if static_features is None:
             self.static_features = [
-                'elev_mean',            # m
-                'slope_mean',           # m/km
-                'area_gages2',          # km^2
-                'frac_forest',          # 1
-                'lai_max',              # 1
-                'lai_diff',             # 1
-                'soil_porosity',        # 1
-                'soil_conductivity',    # cm/hr
-                'max_water_content',    # m
-                'geol_porosity',        # 1
-                'geol_permeability'     # m^2
+                'elev_mean',
+                'slope_mean',
+                'area_gages2',
+                'frac_forest',
+                'lai_max',
+                'lai_diff',
+                'soil_porosity',
+                'soil_conductivity',
+                'max_water_content',
+                'geol_porosity',
+                'geol_permeability'
             ]
         else:
             self.static_features = static_features
 
         if target_features is None:
-            # Multi-task targets: streamflow and evapotranspiration
             self.target_features = ['streamflow', 'evapotranspiration']
         else:
             self.target_features = target_features
 
-        # Load and prepare data
         self.data = self._load_and_prepare_data()
 
-        # Initialize scalers if not provided
-        if scalers is None:
+        if scalers is None and normalize:
+            logger.warning(f"Fitting scalers on entire dataset for basin {basin_id}. "
+                           "This may cause data leakage. Prefer passing pre-trained scalers.")
             self.scalers = self._initialize_scalers()
         else:
-            self.scalers = scalers
+            self.scalers = self._process_scalers(scalers)
 
-        # Normalize data if requested
-        if normalize:
+        if normalize and self.scalers is not None:
             self.data = self._normalize_data()
+        elif normalize and self.scalers is None:
+            raise ValueError("normalize=True but no scalers provided or fitted.")
 
-        # Create sequences
         self.sequences = self._create_sequences()
-
         logger.info(f"Loaded basin {basin_id}: {len(self.sequences)} sequences")
 
-    def _load_and_prepare_data(self) -> Dict[str, np.ndarray]:
-        """Load data from NetCDF file and prepare for training"""
+    def _process_scalers(self, scalers: Dict[str, Any]) -> Dict[str, Any]:
+        processed = {}
+        processed['dynamic'] = scalers.get('dynamic')
+        processed['static'] = scalers.get('static')
+        target_scalers = scalers.get('targets')
+        if target_scalers is None:
+            processed['targets'] = None
+        elif isinstance(target_scalers, list):
+            processed['targets'] = target_scalers
+        else:
+            n_targets = len(self.target_features)
+            if hasattr(target_scalers, 'mean_') and target_scalers.mean_.shape[0] == n_targets:
+                split_scalers = []
+                for i in range(n_targets):
+                    s = StandardScaler()
+                    s.mean_ = np.array([target_scalers.mean_[i]])
+                    s.scale_ = np.array([target_scalers.scale_[i]])
+                    if hasattr(target_scalers, 'var_'):
+                        s.var_ = np.array([target_scalers.var_[i]])
+                    s.n_samples_seen_ = target_scalers.n_samples_seen_
+                    split_scalers.append(s)
+                processed['targets'] = split_scalers
+            else:
+                raise ValueError(f"Unexpected target scaler format. Expected list of scalers or single scaler "
+                                 f"with {n_targets} features, got {target_scalers.mean_.shape[0] if hasattr(target_scalers, 'mean_') else 'unknown'}.")
+        return processed
 
-        # Open NetCDF file
+    def _load_and_prepare_data(self) -> Dict[str, np.ndarray]:
         ds = xr.open_dataset(self.nc_file)
 
-        # Extract dynamic features
         dynamic_data = {}
         for feature in self.dynamic_features:
             if feature in ds:
                 data = ds[feature].values
-                # Handle missing values (NaN)
                 if np.any(np.isnan(data)):
-                    # Linear interpolation for missing values
                     mask = np.isnan(data)
                     data[mask] = np.interp(
                         np.where(mask)[0],
@@ -133,11 +154,9 @@ class HydroBasinDataset(Dataset):
                 logger.warning(f"Dynamic feature {feature} not found in {self.nc_file}")
                 dynamic_data[feature] = np.zeros(len(ds.time))
 
-        # Extract static features
         static_data = {}
         for feature in self.static_features:
             if feature in ds:
-                # Static features are scalar values, repeat for all time steps
                 static_data[feature] = np.full(
                     len(ds.time),
                     float(ds[feature].values)
@@ -146,12 +165,10 @@ class HydroBasinDataset(Dataset):
                 logger.warning(f"Static feature {feature} not found in {self.nc_file}")
                 static_data[feature] = np.zeros(len(ds.time))
 
-        # Extract target features
         target_data = {}
         for feature in self.target_features:
             if feature in ds:
                 data = ds[feature].values
-                # Handle missing values
                 if np.any(np.isnan(data)):
                     mask = np.isnan(data)
                     data[mask] = np.interp(
@@ -164,135 +181,90 @@ class HydroBasinDataset(Dataset):
                 logger.warning(f"Target feature {feature} not found in {self.nc_file}")
                 target_data[feature] = np.zeros(len(ds.time))
 
-        # Extract time information
         time_data = ds.time.values
-
-        # Close dataset
         ds.close()
 
-        # Combine all data
         data = {
             'dynamic': np.column_stack([dynamic_data[f] for f in self.dynamic_features]),
             'static': np.column_stack([static_data[f] for f in self.static_features]),
             'targets': np.column_stack([target_data[f] for f in self.target_features]),
             'time': time_data,
-            'basin_id': self.basin_id
+            'basin_id': self.basin_id,
+            'dynamic_feature_names': self.dynamic_features,
+            'static_feature_names': self.static_features,
+            'target_feature_names': self.target_features
         }
-
-        # Add metadata
-        data['dynamic_feature_names'] = self.dynamic_features
-        data['static_feature_names'] = self.static_features
-        data['target_feature_names'] = self.target_features
-
         return data
 
-    def _initialize_scalers(self) -> Dict[str, StandardScaler]:
-        """Initialize scalers for normalization"""
+    def _initialize_scalers(self) -> Dict[str, Any]:
         scalers = {}
-
-        # Scaler for dynamic features
-        scalers['dynamic'] = StandardScaler()
-        scalers['dynamic'].fit(self.data['dynamic'])
-
-        # Scaler for static features
-        scalers['static'] = StandardScaler()
-        scalers['static'].fit(self.data['static'])
-
-        # Scaler for targets
-        scalers['targets'] = StandardScaler()
-        scalers['targets'].fit(self.data['targets'])
-
+        scalers['dynamic'] = StandardScaler().fit(self.data['dynamic'])
+        scalers['static'] = StandardScaler().fit(self.data['static'])
+        target_scalers = []
+        for i in range(self.data['targets'].shape[1]):
+            col = self.data['targets'][:, i:i+1]
+            target_scalers.append(StandardScaler().fit(col))
+        scalers['targets'] = target_scalers
         return scalers
 
     def _normalize_data(self) -> Dict[str, np.ndarray]:
-        """Normalize data using fitted scalers"""
-        normalized_data = self.data.copy()
-
-        # Normalize dynamic features
-        if self.data['dynamic'].shape[0] > 0:
-            normalized_data['dynamic'] = self.scalers['dynamic'].transform(
-                self.data['dynamic']
-            )
-
-        # Normalize static features
-        if self.data['static'].shape[0] > 0:
-            normalized_data['static'] = self.scalers['static'].transform(
-                self.data['static']
-            )
-
-        # Normalize targets
-        if self.data['targets'].shape[0] > 0:
-            normalized_data['targets'] = self.scalers['targets'].transform(
-                self.data['targets']
-            )
-
-        return normalized_data
+        normalized = self.data.copy()
+        if self.data['dynamic'].shape[0] > 0 and self.scalers['dynamic'] is not None:
+            normalized['dynamic'] = self.scalers['dynamic'].transform(self.data['dynamic'])
+        if self.data['static'].shape[0] > 0 and self.scalers['static'] is not None:
+            normalized['static'] = self.scalers['static'].transform(self.data['static'])
+        if self.data['targets'].shape[0] > 0 and self.scalers['targets'] is not None:
+            target_scalers = self.scalers['targets']
+            normalized_targets = np.zeros_like(self.data['targets'])
+            for i, scaler in enumerate(target_scalers):
+                col = self.data['targets'][:, i:i+1]
+                normalized_targets[:, i:i+1] = scaler.transform(col)
+            normalized['targets'] = normalized_targets
+        return normalized
 
     def _create_sequences(self) -> List[Dict[str, np.ndarray]]:
-        """Create input-output sequences for training"""
         sequences = []
         n_samples = len(self.data['dynamic'])
-
-        # Create sliding windows
         for i in range(self.sequence_length, n_samples - self.prediction_horizon):
-            # Input sequence: dynamic features for past sequence_length days
-            dynamic_seq = self.data['dynamic'][i-self.sequence_length:i, :]
-
-            # Static features (same for all time steps in sequence)
-            static_features = self.data['static'][i, :]  # Use current time step
-
-            # Targets: predict next prediction_horizon days
+            dynamic_seq = self.data['dynamic'][i - self.sequence_length:i, :]
+            static_features = self.data['static'][i, :]
             target_start = i
             target_end = i + self.prediction_horizon
             targets = self.data['targets'][target_start:target_end, :]
 
-            # Combine dynamic and static features
-            # Repeat static features for each time step
             static_seq = np.tile(static_features, (self.sequence_length, 1))
-
-            # Combine features
             features = np.concatenate([dynamic_seq, static_seq], axis=1)
 
-            sequence = {
+            sequences.append({
                 'features': features.astype(np.float32),
                 'targets': targets.astype(np.float32),
                 'basin_id': self.basin_id,
                 'time_index': i,
                 'sequence_length': self.sequence_length,
                 'prediction_horizon': self.prediction_horizon
-            }
-
-            sequences.append(sequence)
-
+            })
         return sequences
 
     def __len__(self) -> int:
-        """Return number of sequences"""
         return len(self.sequences)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Get a sequence by index"""
-        sequence = self.sequences[idx]
-
-        # Convert to torch tensors
-        features = torch.from_numpy(sequence['features'])
-        targets = torch.from_numpy(sequence['targets'])
-
-        # For multi-task learning, we need to separate targets
-        # First column is streamflow, second is evapotranspiration
-        streamflow_target = targets[:, 0:1]  # Keep as 2D tensor
-        et_target = targets[:, 1:2]  # Keep as 2D tensor
+        seq = self.sequences[idx]
+        features = torch.from_numpy(seq['features'])
+        targets = torch.from_numpy(seq['targets'])
+        # Keep 2D shape (prediction_horizon, 1)
+        streamflow_target = targets[:, 0:1]
+        evapotranspiration_target = targets[:, 1:2]
 
         return {
             'features': features,
             'streamflow': streamflow_target,
-            'evapotranspiration': et_target,
-            'basin_id': sequence['basin_id'],
-            'time_index': sequence['time_index']
+            'evapotranspiration': evapotranspiration_target,
+            'basin_id': seq['basin_id'],
+            'time_index': seq['time_index']
         }
 
     def get_data_stats(self) -> Dict[str, Any]:
-        """Get statistics about the dataset"""
         stats = {
             'basin_id': self.basin_id,
             'num_sequences': len(self),
@@ -306,173 +278,259 @@ class HydroBasinDataset(Dataset):
             'num_target_features': len(self.target_features),
             'total_features': len(self.dynamic_features) + len(self.static_features)
         }
-
-        # Add mean and std of original data
         if not self.normalize:
             stats['dynamic_mean'] = np.mean(self.data['dynamic'], axis=0).tolist()
             stats['dynamic_std'] = np.std(self.data['dynamic'], axis=0).tolist()
             stats['target_mean'] = np.mean(self.data['targets'], axis=0).tolist()
             stats['target_std'] = np.std(self.data['targets'], axis=0).tolist()
-
         return stats
+
+    @staticmethod
+    def _get_raw_data(nc_file: str,
+                      basin_id: str,
+                      dynamic_features: List[str],
+                      static_features: List[str],
+                      target_features: List[str]) -> Dict[str, np.ndarray]:
+        ds = xr.open_dataset(nc_file)
+        dynamic = []
+        for f in dynamic_features:
+            if f in ds:
+                arr = ds[f].values
+                if np.any(np.isnan(arr)):
+                    mask = np.isnan(arr)
+                    arr[mask] = np.interp(np.where(mask)[0], np.where(~mask)[0], arr[~mask])
+                dynamic.append(arr)
+            else:
+                dynamic.append(np.zeros(len(ds.time)))
+        static = []
+        for f in static_features:
+            if f in ds:
+                static.append(np.full(len(ds.time), float(ds[f].values)))
+            else:
+                static.append(np.zeros(len(ds.time)))
+        targets = []
+        for f in target_features:
+            if f in ds:
+                arr = ds[f].values
+                if np.any(np.isnan(arr)):
+                    mask = np.isnan(arr)
+                    arr[mask] = np.interp(np.where(mask)[0], np.where(~mask)[0], arr[~mask])
+                targets.append(arr)
+            else:
+                targets.append(np.zeros(len(ds.time)))
+        time = ds.time.values
+        ds.close()
+
+        return {
+            'dynamic': np.column_stack(dynamic),
+            'static': np.column_stack(static),
+            'targets': np.column_stack(targets),
+            'time': time,
+            'basin_id': basin_id
+        }
 
 
 class MultiBasinDataset(Dataset):
     """
-    Dataset combining multiple hydrological basins
-    Supports multi-task learning across different basins
+    Dataset combining multiple hydrological basins.
+    Sequences are pre-filtered according to the desired mode (train/val/test).
     """
 
     def __init__(self,
-                 nc_files: List[str],
-                 basin_ids: List[str],
-                 sequence_length: int = 365,
-                 prediction_horizon: int = 1,
-                 dynamic_features: List[str] = None,
-                 static_features: List[str] = None,
-                 target_features: List[str] = None,
-                 normalize: bool = True,
-                 train_ratio: float = 0.7,
-                 val_ratio: float = 0.15,
-                 mode: str = 'train'):
-        """
-        Initialize multi-basin dataset
+                 basin_datasets: List[HydroBasinDataset],
+                 basin_sequences_indices: List[List[int]]):
+        self.basin_datasets = basin_datasets
+        self.basin_ids = [ds.basin_id for ds in basin_datasets]
 
-        Args:
-            nc_files: List of NetCDF file paths
-            basin_ids: List of basin identifiers
-            sequence_length: Length of input sequence
-            prediction_horizon: Number of days to predict ahead
-            dynamic_features: List of dynamic feature names
-            static_features: List of static feature names
-            target_features: List of target feature names
-            normalize: Whether to normalize features
-            train_ratio: Ratio of data for training
-            val_ratio: Ratio of data for validation
-            mode: 'train', 'val', or 'test'
-        """
-        self.nc_files = nc_files
-        self.basin_ids = basin_ids
-        self.sequence_length = sequence_length
-        self.prediction_horizon = prediction_horizon
-        self.normalize = normalize
-        self.train_ratio = train_ratio
-        self.val_ratio = val_ratio
-        self.mode = mode
+        self.index_map = []
+        for ds_idx, indices in enumerate(basin_sequences_indices):
+            for seq_idx in indices:
+                self.index_map.append((ds_idx, seq_idx))
 
-        # Validate inputs
-        if len(nc_files) != len(basin_ids):
-            raise ValueError("Number of nc_files must match number of basin_ids")
-
-        # Load individual basin datasets
-        self.basin_datasets = []
-        self.all_sequences = []
-        self.failed_basins = []  # track failed basins for debugging
-
-        for nc_file, basin_id in zip(nc_files, basin_ids):
-            try:
-                basin_dataset = HydroBasinDataset(
-                    nc_file=nc_file,
-                    basin_id=basin_id,
-                    sequence_length=sequence_length,
-                    prediction_horizon=prediction_horizon,
-                    dynamic_features=dynamic_features,
-                    static_features=static_features,
-                    target_features=target_features,
-                    normalize=normalize,
-                    scalers=None
-                )
-
-                self.basin_datasets.append(basin_dataset)
-
-                # Split sequences for this basin
-                basin_sequences = self._split_basin_sequences(basin_dataset)
-                self.all_sequences.extend(basin_sequences)
-
-                logger.info(f"Loaded basin {basin_id}: {len(basin_sequences)} sequences for {mode}")
-
-            except Exception as e:
-                # Record failure and continue with next basin
-                error_msg = f"Failed to load basin {basin_id} from {nc_file}: {str(e)}"
-                logger.error(error_msg)
-                self.failed_basins.append((basin_id, nc_file, str(e)))
-                continue
-
-        if not self.all_sequences:
-            # No basins loaded successfully, raise detailed error
-            error_lines = ["No basins were successfully loaded. Failures:"]
-            for basin_id, nc_file, err in self.failed_basins:
-                error_lines.append(f"  - {basin_id} ({nc_file}): {err}")
-            raise ValueError("\n".join(error_lines))
-
-        logger.info(f"MultiBasinDataset initialized with {len(self.all_sequences)} total sequences")
-        if self.failed_basins:
-            logger.warning(f"Skipped {len(self.failed_basins)} basins due to errors")
-
-    def _split_basin_sequences(self, basin_dataset: HydroBasinDataset) -> List[Dict[str, Any]]:
-        """Split sequences for a single basin into train/val/test"""
-        all_sequences = basin_dataset.sequences
-        n_sequences = len(all_sequences)
-
-        # Calculate split indices
-        train_end = int(n_sequences * self.train_ratio)
-        val_end = train_end + int(n_sequences * self.val_ratio)
-
-        # Split sequences
-        if self.mode == 'train':
-            return all_sequences[:train_end]
-        elif self.mode == 'val':
-            return all_sequences[train_end:val_end]
-        elif self.mode == 'test':
-            return all_sequences[val_end:]
-        else:
-            raise ValueError(f"Unknown mode: {self.mode}")
+        logger.info(f"MultiBasinDataset created with {len(self)} sequences.")
 
     def __len__(self) -> int:
-        """Return total number of sequences"""
-        return len(self.all_sequences)
+        return len(self.index_map)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Get a sequence by index"""
-        sequence = self.all_sequences[idx]
+        ds_idx, seq_idx = self.index_map[idx]
+        basin_ds = self.basin_datasets[ds_idx]
+        seq = basin_ds.sequences[seq_idx]
 
-        # Convert to torch tensors
-        features = torch.from_numpy(sequence['features'])
-        targets = torch.from_numpy(sequence['targets'])
-
-        # Separate targets for multi-task learning
+        features = torch.from_numpy(seq['features'])
+        targets = torch.from_numpy(seq['targets'])
+        # Keep 2D shape (prediction_horizon, 1)
         streamflow_target = targets[:, 0:1]
-        et_target = targets[:, 1:2]
+        evapotranspiration_target = targets[:, 1:2]
 
-        # Get basin index for embedding
-        basin_id = sequence['basin_id']
+        basin_id = seq['basin_id']
         basin_idx = self.basin_ids.index(basin_id)
 
         return {
             'features': features,
             'streamflow': streamflow_target,
-            'evapotranspiration': et_target,
+            'evapotranspiration': evapotranspiration_target,
             'basin_id': basin_id,
             'basin_idx': torch.tensor(basin_idx, dtype=torch.long),
-            'time_index': sequence['time_index']
+            'time_index': seq['time_index']
         }
 
     def get_dataset_stats(self) -> Dict[str, Any]:
-        """Get statistics about the multi-basin dataset"""
         stats = {
             'num_basins': len(self.basin_datasets),
             'total_sequences': len(self),
-            'mode': self.mode,
-            'sequence_length': self.sequence_length,
-            'prediction_horizon': self.prediction_horizon,
             'basin_ids': self.basin_ids
         }
-
-        # Get stats from each basin dataset
-        basin_stats = []
-        for dataset in self.basin_datasets:
-            basin_stats.append(dataset.get_data_stats())
-
+        basin_stats = [ds.get_data_stats() for ds in self.basin_datasets]
         stats['basin_details'] = basin_stats
-
         return stats
+
+
+def build_multi_basin_datasets(
+        nc_files: List[str],
+        basin_ids: List[str],
+        sequence_length: int = 365,
+        prediction_horizon: int = 1,
+        dynamic_features: List[str] = None,
+        static_features: List[str] = None,
+        target_features: List[str] = None,
+        train_ratio: float = 0.7,
+        val_ratio: float = 0.15,
+        train_period: Optional[Tuple[str, str]] = None,
+        val_period: Optional[Tuple[str, str]] = None,
+        test_period: Optional[Tuple[str, str]] = None,
+        ) -> Tuple[MultiBasinDataset, MultiBasinDataset, MultiBasinDataset]:
+    """
+    Build train, validation, and test MultiBasinDatasets with correct normalization.
+    If train_period/val_period/test_period are provided, they override train_ratio/val_ratio.
+    """
+    if len(nc_files) != len(basin_ids):
+        raise ValueError("Number of nc_files must match number of basin_ids")
+
+    if dynamic_features is None:
+        dynamic_features = [
+            'total_precipitation', 'temperature', 'specific_humidity',
+            'shortwave_radiation', 'potential_energy'
+        ]
+    if static_features is None:
+        static_features = [
+            'elev_mean', 'slope_mean', 'area_gages2', 'frac_forest',
+            'lai_max', 'lai_diff', 'soil_porosity', 'soil_conductivity',
+            'max_water_content', 'geol_porosity', 'geol_permeability'
+        ]
+    if target_features is None:
+        target_features = ['streamflow', 'evapotranspiration']
+
+    raw_data_list = []
+    all_train_abs = []
+    all_val_abs = []
+    all_test_abs = []
+
+    total_basins = len(nc_files)
+    for idx, (nc_file, basin_id) in enumerate(tqdm(zip(nc_files, basin_ids), total=total_basins, desc="Loading basins")):
+        raw = HydroBasinDataset._get_raw_data(
+            nc_file, basin_id, dynamic_features, static_features, target_features
+        )
+        raw_data_list.append(raw)
+
+        time = raw['time']
+        n_total = len(time)
+        first_seq_start = sequence_length
+        last_seq_start = n_total - prediction_horizon - 1
+        if first_seq_start > last_seq_start:
+            raise ValueError(f"Basin {basin_id} has insufficient data: n_total={n_total}, "
+                             f"sequence_length={sequence_length}, prediction_horizon={prediction_horizon}")
+
+        if train_period is not None and val_period is not None and test_period is not None:
+            train_start = np.datetime64(train_period[0])
+            train_end   = np.datetime64(train_period[1])
+            val_start   = np.datetime64(val_period[0])
+            val_end     = np.datetime64(val_period[1])
+            test_start  = np.datetime64(test_period[0])
+            test_end    = np.datetime64(test_period[1])
+
+            seq_dates = time[first_seq_start:last_seq_start+1]
+
+            train_mask = (seq_dates >= train_start) & (seq_dates <= train_end)
+            val_mask   = (seq_dates >= val_start)   & (seq_dates <= val_end)
+            test_mask  = (seq_dates >= test_start)  & (seq_dates <= test_end)
+
+            train_abs = np.where(train_mask)[0] + first_seq_start
+            val_abs   = np.where(val_mask)[0]   + first_seq_start
+            test_abs  = np.where(test_mask)[0]  + first_seq_start
+
+            if len(train_abs) == 0:
+                logger.warning(f"No training sequences found for basin {basin_id} in period {train_period}")
+            if len(val_abs) == 0:
+                logger.warning(f"No validation sequences found for basin {basin_id} in period {val_period}")
+            if len(test_abs) == 0:
+                logger.warning(f"No test sequences found for basin {basin_id} in period {test_period}")
+
+        else:
+            n_seq = last_seq_start - first_seq_start + 1
+            train_end_abs = first_seq_start + int(n_seq * train_ratio)
+            val_end_abs   = train_end_abs + int(n_seq * val_ratio)
+            train_abs = list(range(first_seq_start, train_end_abs))
+            val_abs   = list(range(train_end_abs, val_end_abs))
+            test_abs  = list(range(val_end_abs, last_seq_start + 1))
+
+        all_train_abs.append(train_abs)
+        all_val_abs.append(val_abs)
+        all_test_abs.append(test_abs)
+
+    basin_datasets = []
+    train_seq_indices = []
+    val_seq_indices = []
+    test_seq_indices = []
+
+    for i, (raw, basin_id, nc_file) in enumerate(zip(raw_data_list, basin_ids, nc_files)):
+        train_abs = all_train_abs[i]
+        if len(train_abs) == 0:
+            raise ValueError(f"Basin {basin_id} has no training sequences.")
+
+        first_train_start = train_abs[0] - sequence_length
+        last_train_end = train_abs[-1] + prediction_horizon
+        first_train_start = max(0, first_train_start)
+        last_train_end = min(len(raw['time']), last_train_end)
+        train_slice = slice(first_train_start, last_train_end)
+
+        scaler_dynamic = StandardScaler().fit(raw['dynamic'][train_slice])
+        scaler_static = StandardScaler().fit(raw['static'][train_slice])
+        target_scalers = []
+        for t_idx in range(raw['targets'].shape[1]):
+            col = raw['targets'][train_slice, t_idx:t_idx+1]
+            target_scalers.append(StandardScaler().fit(col))
+
+        scalers = {
+            'dynamic': scaler_dynamic,
+            'static': scaler_static,
+            'targets': target_scalers
+        }
+
+        ds = HydroBasinDataset(
+            nc_file=nc_file,
+            basin_id=basin_id,
+            sequence_length=sequence_length,
+            prediction_horizon=prediction_horizon,
+            dynamic_features=dynamic_features,
+            static_features=static_features,
+            target_features=target_features,
+            normalize=True,
+            scalers=scalers
+        )
+        basin_datasets.append(ds)
+
+        base = sequence_length
+        train_seq = [s - base for s in train_abs if s - base >= 0]
+        val_seq   = [s - base for s in all_val_abs[i]   if s - base >= 0]
+        test_seq  = [s - base for s in all_test_abs[i]  if s - base >= 0]
+
+        train_seq_indices.append(train_seq)
+        val_seq_indices.append(val_seq)
+        test_seq_indices.append(test_seq)
+
+    train_dataset = MultiBasinDataset(basin_datasets, train_seq_indices)
+    val_dataset   = MultiBasinDataset(basin_datasets, val_seq_indices)
+    test_dataset  = MultiBasinDataset(basin_datasets, test_seq_indices)
+
+    return train_dataset, val_dataset, test_dataset

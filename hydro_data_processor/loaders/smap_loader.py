@@ -24,92 +24,58 @@ class SMAPLoader(BaseDataLoader):
         logger.info(f"SMAPLoader initialized for {config.data_source_path}")
 
     def load(self, gage_ids: List[str], **kwargs) -> pd.DataFrame:
-        """
-        Load SMAP data for specified gauges for model evaluation only.
-        
-        Args:
-            gage_ids: List of gage IDs to load (8-digit format, e.g., "01013500")
-            **kwargs: Additional parameters including:
-                - huc2: HUC2 code (optional, can be inferred)
-                - start_date: Start date for filtering (optional)
-                - end_date: End date for filtering (optional)
-
-        Returns:
-            DataFrame with SMAP ssm data only, no interpolation for missing values
-        """
         if not gage_ids:
             logger.warning("No gage IDs provided")
             return pd.DataFrame()
 
         all_data = []
-
         for gage_id in gage_ids:
             try:
                 gage_data = self._load_single_gauge(gage_id, **kwargs)
                 if gage_data is not None and not gage_data.empty:
-                    # Filter to only ssm variable as per paper requirements
                     gage_data = self._filter_to_ssm_only(gage_data)
                     all_data.append(gage_data)
                     logger.debug(f"Loaded SMAP data for gage {gage_id}")
                 else:
-                    logger.warning(f"No SMAP data found for gage {gage_id}")
+                    logger.debug(f"No SMAP data found for gage {gage_id}")
             except Exception as e:
                 logger.error(f"Error loading SMAP data for gage {gage_id}: {e}")
 
         if not all_data:
             return pd.DataFrame()
 
-        # Combine all gage data
         combined_df = pd.concat(all_data, ignore_index=True)
-
-        # Apply date filtering if specified
         start_date = kwargs.get('start_date')
         end_date = kwargs.get('end_date')
         if start_date or end_date:
             combined_df = self._filter_by_dates(combined_df, start_date, end_date)
-
-        # Store and return
         self.data = combined_df
         return combined_df
 
     def _filter_to_ssm_only(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Filter DataFrame to only include ssm variable as per paper requirements."""
         if df.empty:
             return df
-        
-        # Keep only date, gage_id, and ssm columns
         keep_cols = ['date', 'gage_id']
         if 'ssm' in df.columns:
             keep_cols.append('ssm')
         else:
             logger.warning("ssm column not found in SMAP data")
             df['ssm'] = np.nan
-        
-        # Drop all other columns
-        df = df[keep_cols]
-        return df
+        return df[keep_cols]
 
     def _load_single_gauge(self, gage_id: str, **kwargs) -> Optional[pd.DataFrame]:
-        """Load SMAP data for a single gage."""
         huc2 = kwargs.get('huc2')
-
-        # Try to determine HUC2 if not provided
         if not huc2:
             huc2 = self._find_huc2_for_gauge(gage_id)
             if not huc2:
-                logger.warning(f"Cannot determine HUC2 for gage {gage_id}")
+                logger.debug(f"Cannot determine HUC2 for gage {gage_id}")
                 return None
-
-        # Build file path
         file_path = self._build_file_path(gage_id, huc2)
         if not file_path or not file_path.exists():
-            # Try alternative path patterns
             file_path = self._find_alternative_path(gage_id, huc2)
             if not file_path or not file_path.exists():
                 logger.debug(f"SMAP file not found for gage {gage_id} in HUC2 {huc2}")
                 return None
-
-        # Read and process the file
         try:
             return self._read_and_process_file(file_path, gage_id)
         except Exception as e:
@@ -117,124 +83,72 @@ class SMAPLoader(BaseDataLoader):
             return None
 
     def _build_file_path(self, gage_id: str, huc2: str) -> Optional[Path]:
-        """Build file path from configuration."""
         if not self.config.data_source_path.exists():
             logger.warning(f"Data source path does not exist: {self.config.data_source_path}")
             return None
-
-        # Use the configuration's get_file_path method if available
         if hasattr(self.config, 'get_file_path'):
             return self.config.get_file_path(gage_id, huc2)
-
-        # Otherwise build manually
         path = self.config.data_source_path
-
         if self.config.subdirectory:
             subdir = self.config.subdirectory.format(huc2=huc2)
             path = path / subdir
-
         if self.config.file_pattern:
-            # Use the original 8-digit gage_id in file pattern
-            filename = self.config.file_pattern.replace('{basin_id}', gage_id)
-            filename = filename.replace('{gage_id}', gage_id)
+            filename = self.config.file_pattern.replace('{basin_id}', gage_id).replace('{gage_id}', gage_id)
             path = path / filename
-
         return path
 
     def _find_huc2_for_gauge(self, gage_id: str) -> Optional[str]:
-        """Try to find HUC2 code for a gage by scanning directories."""
         if not self.config.data_source_path.exists():
             return None
-
-        # Look for HUC2 directories
         huc2_dirs = [d for d in self.config.data_source_path.iterdir()
                      if d.is_dir() and d.name.isdigit() and len(d.name) == 2]
-
         for huc2_dir in huc2_dirs:
-            # Check if file exists in this HUC2 directory
             test_path = self._build_file_path(gage_id, huc2_dir.name)
             if test_path and test_path.exists():
                 return huc2_dir.name
-
         return None
 
     def _find_alternative_path(self, gage_id: str, huc2: str) -> Optional[Path]:
-        """Try alternative path patterns if default doesn't exist."""
-        # Try standard CAMELS pattern
         alt_path = self.config.data_source_path / "NASA_USDA_SMAP_CAMELS" / huc2 / f"{gage_id}_lump_nasa_usda_smap.txt"
         if alt_path.exists():
             return alt_path
-
         return None
 
     def _read_and_process_file(self, file_path: Path, gage_id: str) -> pd.DataFrame:
-        """Read and process SMAP data file - only ssm variable as per paper."""
         try:
-            # Read SMAP data (comma-separated with header)
             df = pd.read_csv(file_path, sep=',', header=0)
-
-            # Standardize column names - only keep ssm as per paper requirements
             column_mapping = {
-                'Year': 'year',
-                'Mnth': 'month',
-                'Day': 'day',
-                'Hr': 'hour',
-                'ssm(mm)': 'ssm'  # Only ssm is used for model evaluation
-                # Note: Following paper requirements, we ignore susm, smp, ssma, susma
+                'Year': 'year', 'Mnth': 'month', 'Day': 'day', 'Hr': 'hour',
+                'ssm(mm)': 'ssm'
             }
-            
             df = df.rename(columns=column_mapping)
-
-            # Convert numeric columns
             df['year'] = df['year'].astype(int)
             df['month'] = df['month'].astype(int)
             df['day'] = df['day'].astype(int)
-
-            # Create date column
             df['date'] = pd.to_datetime(df[['year', 'month', 'day']])
-
-            # Convert ssm column to numeric
             if 'ssm' in df.columns:
                 df['ssm'] = pd.to_numeric(df['ssm'], errors='coerce')
             else:
-                logger.warning(f"ssm column not found in {file_path}")
                 df['ssm'] = np.nan
-
-            # Add gage_id (original 8-digit format)
             df['gage_id'] = gage_id
-
-            # Drop year/month/day/hour columns
             cols_to_drop = ['year', 'month', 'day', 'hour']
             cols_to_drop = [col for col in cols_to_drop if col in df.columns]
             df = df.drop(columns=cols_to_drop)
-
-            # Reorder columns - only date, gage_id, ssm
-            col_order = ['date', 'gage_id', 'ssm']
-            df = df[col_order]
-
+            df = df[['date', 'gage_id', 'ssm']]
             logger.debug(f"Loaded SMAP data from {file_path}: {len(df)} records")
             return df
-
         except Exception as e:
             logger.error(f"Error reading SMAP file {file_path}: {e}")
-            # Try with different separators if comma fails
             try:
                 df = pd.read_csv(file_path, sep=r'\s+', header=0)
-                # Apply same column renaming and processing
                 return self._process_dataframe(df, gage_id)
             except Exception as e2:
                 logger.error(f"Failed to read SMAP file with whitespace separator: {e2}")
                 raise
 
     def _process_dataframe(self, df: pd.DataFrame, gage_id: str) -> pd.DataFrame:
-        """Process SMAP dataframe after reading with alternative separator."""
-        # Standardize column names (may have different format)
-        # Find the actual column names
         actual_columns = list(df.columns)
-        
-        # Map expected column names based on position or partial matching
         column_mapping = {}
-        
         for i, col in enumerate(actual_columns):
             col_lower = col.lower()
             if 'year' in col_lower:
@@ -247,49 +161,29 @@ class SMAPLoader(BaseDataLoader):
                 column_mapping[col] = 'hour'
             elif 'ssm' in col_lower:
                 column_mapping[col] = 'ssm'
-            # Note: We ignore other SMAP variables as per paper requirements
-        
         df = df.rename(columns=column_mapping)
-        
-        # Continue with processing
         df['year'] = df['year'].astype(int)
         df['month'] = df['month'].astype(int)
         df['day'] = df['day'].astype(int)
         df['date'] = pd.to_datetime(df[['year', 'month', 'day']])
-        
         if 'ssm' in df.columns:
             df['ssm'] = pd.to_numeric(df['ssm'], errors='coerce')
         else:
             df['ssm'] = np.nan
-        
         df['gage_id'] = gage_id
-        
-        # Drop unnecessary columns
         cols_to_drop = ['year', 'month', 'day', 'hour']
         cols_to_drop = [col for col in cols_to_drop if col in df.columns]
         df = df.drop(columns=cols_to_drop)
-        
-        # Reorder columns - only date, gage_id, ssm
-        col_order = ['date', 'gage_id', 'ssm']
-        df = df[col_order]
-        
+        df = df[['date', 'gage_id', 'ssm']]
         return df
 
-    def _filter_by_dates(self, df: pd.DataFrame, start_date: Optional[str],
-                         end_date: Optional[str]) -> pd.DataFrame:
-        """Filter DataFrame by date range."""
+    def _filter_by_dates(self, df: pd.DataFrame, start_date: Optional[str], end_date: Optional[str]) -> pd.DataFrame:
         if df.empty or 'date' not in df.columns:
             return df
-
         df = df.copy()
         df['date'] = pd.to_datetime(df['date'])
-
         if start_date:
-            start_dt = pd.Timestamp(start_date)
-            df = df[df['date'] >= start_dt]
-
+            df = df[df['date'] >= pd.Timestamp(start_date)]
         if end_date:
-            end_dt = pd.Timestamp(end_date)
-            df = df[df['date'] <= end_dt]
-
+            df = df[df['date'] <= pd.Timestamp(end_date)]
         return df.reset_index(drop=True)

@@ -1,6 +1,7 @@
 """
 Attribute loader for CAMELS basin attributes.
-Modified to ensure all 17 static attributes from paper Table 1 are loaded.
+Modified to ensure required static attributes are loaded,
+and to add one-hot encoded columns for categorical variables (without dropping originals).
 """
 
 import pandas as pd
@@ -8,6 +9,7 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 import logging
+import re
 
 from .base_loader import BaseDataLoader
 from hydro_data_processor.config.settings import DataSourceConfig
@@ -17,19 +19,17 @@ logger = logging.getLogger(__name__)
 
 
 class AttributeLoader(BaseDataLoader):
-    """Loader for CAMELS basin attributes with paper Table 1 compliance."""
+    """Loader for CAMELS basin attributes and one-hot encoding."""
 
     ATTRIBUTE_FILES = {
         "name": "camels_name.txt",
-        "hydro": "camels_hydro.txt",
-        "clim": "camels_clim.txt",
-        "topo": "camels_topo.txt",
-        "soil": "camels_soil.txt",
         "vege": "camels_vege.txt",
+        "soil": "camels_soil.txt",
         "geol": "camels_geol.txt",
+        "topo": "camels_topo.txt",
     }
     
-    # Paper Table 1 static variable mapping with CAMELS column names
+    # Static variable mapping with CAMELS column names
     STATIC_VARIABLE_MAPPING = {
         # Terrain attributes (3)
         'elev_mean': 'elev_mean',
@@ -43,9 +43,9 @@ class AttributeLoader(BaseDataLoader):
         'dom_land_cover_frac': 'dom_land_cover_frac',
         'dom_land_cover': 'dom_land_cover',
         
-        # Soil attributes (5) - Note: root_depth_50 may need special handling
+        # Soil attributes (5)
         'root_depth_50': 'root_depth_50',
-        'soil_depth_statgs0': 'soil_depth_statsgo',
+        'soil_depth_statgso': 'soil_depth_statsgo',
         'soil_porosity': 'soil_porosity',
         'soil_conductivity': 'soil_conductivity',
         'max_water_content': 'max_water_content',
@@ -57,18 +57,30 @@ class AttributeLoader(BaseDataLoader):
         'geol_permeability': 'geol_permeability',
     }
     
-    # Paper-required static variables from Table 1
-    PAPER_REQUIRED_VARIABLES = [
-        # Terrain (3)
+    # Required static variables (17 in total)
+    REQUIRED_STATIC_VARS = [
+        # Terrain
         'elev_mean', 'slope_mean', 'area_gages2',
-        # Land cover (5)
+        # Land cover
         'frac_forest', 'lai_max', 'lai_diff',
         'dom_land_cover_frac', 'dom_land_cover',
-        # Soil (5)
-        'root_depth_50', 'soil_depth_statgs0', 'soil_porosity',
+        # Soil
+        'root_depth_50', 'soil_depth_statgso', 'soil_porosity',
         'soil_conductivity', 'max_water_content',
-        # Geology (4)
+        # Geology
         'geol_class_1st', 'geol_class_2nd',
+        'geol_porosity', 'geol_permeability'
+    ]
+    
+    # Categorical variables to one-hot encode (original columns are kept)
+    CATEGORICAL_VARS = ['dom_land_cover', 'geol_class_1st', 'geol_class_2nd']
+
+    # Whitelist of allowed static variables (paper Table 1)
+    ALLOWED_STATIC = [
+        'elev_mean', 'slope_mean', 'area_gages2',
+        'frac_forest', 'lai_max', 'lai_diff', 'dom_land_cover_frac',
+        'root_depth_50', 'soil_depth_statgso', 'soil_porosity',
+        'soil_conductivity', 'max_water_content',
         'geol_porosity', 'geol_permeability'
     ]
 
@@ -80,12 +92,13 @@ class AttributeLoader(BaseDataLoader):
         self._debug_counter = 0
         self._max_debug_samples = 5
 
-        logger.debug(f"AttributeLoader initialized for paper Table 1 compliance")
+        logger.debug(f"AttributeLoader initialized for one-hot encoding")
 
     def load(self, max_basins: Optional[int] = None, selected_basins: Optional[List[str]] = None,
-            skip_validation: bool = False, **kwargs) -> pd.DataFrame:
+             skip_validation: bool = False, **kwargs) -> pd.DataFrame:
         """
-        Load basin attributes from all CAMELS attribute files.
+        Load basin attributes from all CAMELS attribute files, then add one-hot encoded columns
+        for categorical variables (original columns are kept).
 
         Args:
             max_basins: Maximum number of basins to load, None means all basins
@@ -94,9 +107,9 @@ class AttributeLoader(BaseDataLoader):
                             Use this when you need to load all basins for custom filtering.
 
         Returns:
-            Merged DataFrame with all 17 paper-required static attributes
+            Merged DataFrame with all required static attributes plus one-hot encoded columns.
         """
-        logger.info("Loading CAMELS basin attributes for paper Table 1 compliance")
+        logger.info("Loading CAMELS basin attributes")
         
         if max_basins is None:
             logger.info("max_basins is None - will load ALL available basins")
@@ -201,23 +214,45 @@ class AttributeLoader(BaseDataLoader):
                     merged_df.at[idx, 'huc_02'] = huc_mapping.loc[gage_id]
 
         # -----------------------------------------------------------------
-        # Step 7: Standardize column names to match paper Table 1
+        # Step 7: Standardize column names to match required static variables
         # -----------------------------------------------------------------
         merged_df = self._standardize_column_names(merged_df)
         
         # -----------------------------------------------------------------
-        # Step 8: Ensure all required paper variables exist
+        # Step 8: Add one-hot encoded columns for categorical variables
+        # (original columns are kept)
         # -----------------------------------------------------------------
-        merged_df = self._ensure_paper_required_variables(merged_df)
+        merged_df = self._encode_categorical_variables(merged_df)
         
         # -----------------------------------------------------------------
-        # Step 9: Validate paper compliance
+        # Step 9: Keep only allowed static variables (paper Table 1) and one-hot columns
         # -----------------------------------------------------------------
-        validation = self._validate_paper_compliance(merged_df)
-        self._log_paper_compliance(validation)
+        allowed_cols = set(self.ALLOWED_STATIC)
+        # Add one-hot encoded columns
+        for col in merged_df.columns:
+            if (col.startswith('dom_land_cover_') or 
+                col.startswith('geol_class_1st_') or 
+                col.startswith('geol_class_2nd_')):
+                allowed_cols.add(col)
+        # Keep gage_id and huc_02 as well
+        keep_cols = ['gage_id'] + [c for c in allowed_cols if c in merged_df.columns]
+        if 'huc_02' in merged_df.columns:
+            keep_cols.append('huc_02')
+        merged_df = merged_df[keep_cols]
+        
+        # -----------------------------------------------------------------
+        # Step 10: Ensure all required static variables exist (numeric ones only)
+        # -----------------------------------------------------------------
+        merged_df = self._ensure_required_variables(merged_df)
+        
+        # -----------------------------------------------------------------
+        # Step 11: Validate variable completeness
+        # -----------------------------------------------------------------
+        validation = self._validate_variable_completeness(merged_df)
+        self._log_completeness(validation)
 
         # -----------------------------------------------------------------
-        # Step 10: Apply max_basins limit (only if specified)
+        # Step 12: Apply max_basins limit (only if specified)
         # -----------------------------------------------------------------
         if max_basins is not None and max_basins < len(merged_df):
             logger.info(f"Limiting to {max_basins} basins (as requested)")
@@ -226,22 +261,22 @@ class AttributeLoader(BaseDataLoader):
             logger.info(f"Loaded ALL {len(merged_df)} basins")
 
         # -----------------------------------------------------------------
-        # Step 11: Store metadata and data
+        # Step 13: Store metadata and data
         # -----------------------------------------------------------------
         self.metadata = {
             "total_basins": len(merged_df),
-            "paper_required_variables_count": len(self.PAPER_REQUIRED_VARIABLES),
-            "paper_variables_loaded": validation['present_count'],
-            "paper_variables_missing": validation['missing_count'],
+            "required_variables_count": len(self.REQUIRED_STATIC_VARS),
+            "variables_loaded": validation['present_count'],
+            "variables_missing": validation['missing_count'],
             "attribute_files": list(self.ATTRIBUTE_FILES.keys()),
             "columns": list(merged_df.columns)
         }
 
         self.data = merged_df
-        logger.info(f"Loaded attributes for {len(merged_df)} basins with {validation['present_count']}/{len(self.PAPER_REQUIRED_VARIABLES)} paper variables")
+        logger.info(f"Loaded attributes for {len(merged_df)} basins with {validation['present_count']}/{len(self.REQUIRED_STATIC_VARS)} required variables")
         
         if logger.isEnabledFor(logging.DEBUG):
-            critical_vars = ['root_depth_50', 'frac_forest', 'soil_depth_statgs0']
+            critical_vars = ['root_depth_50', 'frac_forest', 'soil_depth_statgso']
             for var in critical_vars:
                 if var in merged_df.columns:
                     non_na_count = merged_df[var].notna().sum()
@@ -250,20 +285,55 @@ class AttributeLoader(BaseDataLoader):
                     
                     if non_na_count > 0:
                         sample_vals = merged_df.loc[merged_df[var].notna(), ['gage_id', var]].head(3).to_dict(orient='records')
-                        logger.debug(f"Paper variable {var}: coverage={coverage:.1%}, sample values: {sample_vals}")
+                        logger.debug(f"Variable {var}: coverage={coverage:.1%}, sample values: {sample_vals}")
         
         if 'huc_02' in merged_df.columns and logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"HUC2 values sample: {merged_df['huc_02'].head().tolist()}")
         
         return merged_df
 
+    def _encode_categorical_variables(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add one-hot encoded columns for categorical variables and drop original columns.
+        """
+        if df.empty:
+            return df
+
+        df = df.copy()
+        for var in self.CATEGORICAL_VARS:
+            if var not in df.columns:
+                logger.warning(f"Categorical variable {var} not found, skipping encoding")
+                continue
+
+            col = df[var].fillna('missing').astype(str)
+            dummies = pd.get_dummies(col, prefix=var, dummy_na=False)
+
+            def sanitize_name(name: str) -> str:
+                name = name.replace(' ', '_')
+                name = re.sub(r'[\(\)\[\]\{\}/\\]', '', name)
+                if name and name[0].isdigit():
+                    name = '_' + name
+                return name
+
+            for dummy_col in dummies.columns:
+                safe_col = sanitize_name(dummy_col)
+                df[safe_col] = dummies[dummy_col].astype(int)
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"Added one-hot encoded column: {safe_col}")
+
+            # Drop the original categorical column (now encoded)
+            df = df.drop(columns=[var])
+
+            logger.info(f"One-hot encoded {var} into {len(dummies.columns)} binary features (original dropped)")
+
+        return df
+
+    # -------------------------------------------------------------------------
+    # Helper methods (unchanged)
+    # -------------------------------------------------------------------------
     def _format_gage_id(self, gage_id_str: str) -> str:
-        """Format gage_id to 8-digit string without debug logging."""
         try:
-            # Remove any non-digit characters
             clean_id = ''.join(filter(str.isdigit, str(gage_id_str)))
-            
-            # Pad to 8 digits
             if len(clean_id) == 7:
                 return '0' + clean_id
             elif len(clean_id) == 8:
@@ -274,27 +344,19 @@ class AttributeLoader(BaseDataLoader):
             return str(gage_id_str).zfill(8)
 
     def _format_gage_ids_batch(self, df: pd.DataFrame, context: str = "") -> pd.DataFrame:
-        """Format gage_id column in a DataFrame with batch logging."""
         if 'gage_id' not in df.columns:
             return df
         
-        # Count original lengths before formatting
         original_lengths = df['gage_id'].astype(str).str.len().value_counts().to_dict()
-        
-        # Apply formatting
         df = df.copy()
         df['gage_id'] = df['gage_id'].apply(self._format_gage_id)
-        
-        # Count formatted lengths
         formatted_lengths = df['gage_id'].str.len().value_counts().to_dict()
         
-        # Log summary instead of individual conversions
         if logger.isEnabledFor(logging.DEBUG) and original_lengths != formatted_lengths:
             logger.debug(f"Gage ID formatting for {context}:")
             logger.debug(f"  Original length distribution: {original_lengths}")
             logger.debug(f"  Formatted length distribution: {formatted_lengths}")
             
-            # Log a few sample conversions if needed
             if self._debug_counter < self._max_debug_samples:
                 sample_size = min(3, len(df))
                 for i in range(sample_size):
@@ -305,28 +367,23 @@ class AttributeLoader(BaseDataLoader):
         
         return df
 
-    def _load_attribute_file(self, attr_type: str,
-                             filename: str) -> Optional[pd.DataFrame]:
-        """Load a single attribute file with proper NA value handling."""
+    def _load_attribute_file(self, attr_type: str, filename: str) -> Optional[pd.DataFrame]:
         file_path = self.config.data_source_path / filename
-
         if not file_path.exists():
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"Attribute file not found: {file_path}")
             return None
 
         try:
-            # Use na_values parameter to properly handle NA strings
             df = pd.read_csv(
                 file_path, 
                 delimiter=';',
-                dtype={'gauge_id': str},  # Read as string to preserve format
+                dtype={'gauge_id': str},
                 na_values=['NA', 'NaN', 'nan', '', ' ', 'None', 'none', 'NULL', 'null'],
                 keep_default_na=True,
                 engine='python'
             )
             
-            # Fix column naming inconsistency
             if 'gauge_id' in df.columns and 'gage_id' not in df.columns:
                 df = df.rename(columns={'gauge_id': 'gage_id'})
                 if logger.isEnabledFor(logging.DEBUG):
@@ -336,13 +393,10 @@ class AttributeLoader(BaseDataLoader):
                 logger.error(f"No gage_id column in {filename}")
                 return None
 
-            # Clean gage_id - strip whitespace
             df['gage_id'] = df['gage_id'].astype(str).str.strip()
             
-            # Special handling for vegetation file - ensure root_depth_50 is numeric
             if attr_type == "vege" and 'root_depth_50' in df.columns:
                 df['root_depth_50'] = pd.to_numeric(df['root_depth_50'], errors='coerce')
-                
                 if logger.isEnabledFor(logging.DEBUG):
                     non_na_count = df['root_depth_50'].notna().sum()
                     total_count = len(df)
@@ -359,35 +413,29 @@ class AttributeLoader(BaseDataLoader):
             return None
 
     def _standardize_column_names(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Standardize column names to match paper Table 1 requirements."""
         df = df.copy()
         
-        # Convert pct_forest to frac_forest (percentage to fraction)
         if 'pct_forest' in df.columns and 'frac_forest' not in df.columns:
             df['frac_forest'] = df['pct_forest'] / 100.0
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug("Converted pct_forest to frac_forest (percentage to fraction)")
         
-        # Handle soil_depth_statsgo column name
-        if 'soil_depth_statsgo' in df.columns and 'soil_depth_statgs0' not in df.columns:
-            df['soil_depth_statgs0'] = df['soil_depth_statsgo']
+        if 'soil_depth_statsgo' in df.columns and 'soil_depth_statgso' not in df.columns:
+            df['soil_depth_statgso'] = df['soil_depth_statsgo']
             if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("Renamed soil_depth_statsgo to soil_depth_statgs0")
+                logger.debug("Renamed soil_depth_statsgo to soil_depth_statgso")
         
-        # Handle geol_porostiy typo
         if 'geol_porostiy' in df.columns and 'geol_porosity' not in df.columns:
             df['geol_porosity'] = df['geol_porostiy']
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug("Renamed geol_porostiy to geol_porosity")
         
-        # Rename other columns according to mapping
         for target_name, source_name in self.STATIC_VARIABLE_MAPPING.items():
             if source_name in df.columns and target_name not in df.columns:
                 df[target_name] = df[source_name]
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(f"Mapped {source_name} to {target_name}")
         
-        # Debug: Check for root_depth_50 column specifically
         if 'root_depth_50' in df.columns and logger.isEnabledFor(logging.DEBUG):
             non_na = df['root_depth_50'].notna().sum()
             total = len(df)
@@ -395,42 +443,43 @@ class AttributeLoader(BaseDataLoader):
         
         return df
 
-    def _ensure_paper_required_variables(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Ensure all paper-required static variables exist in DataFrame."""
-        for var in self.PAPER_REQUIRED_VARIABLES:
+    def _ensure_required_variables(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Ensure all required static variables (numeric) exist in DataFrame."""
+        required_numeric = [v for v in self.REQUIRED_STATIC_VARS if v not in self.CATEGORICAL_VARS]
+        
+        for var in required_numeric:
             if var not in df.columns:
-                logger.warning(f"Paper-required static variable {var} not found, filling with NaN")
+                logger.warning(f"Required numeric variable {var} not found, filling with NaN")
                 df[var] = np.nan
         
-        # Special handling for root_depth_50 if it's NaN for all rows
         if 'root_depth_50' in df.columns and df['root_depth_50'].isna().all():
             logger.warning("root_depth_50 is NaN for all basins, attempting to estimate from soil data")
-            if 'soil_depth_statgs0' in df.columns and df['soil_depth_statgs0'].notna().any():
-                df['root_depth_50'] = df['soil_depth_statgs0'] * 0.5
-                logger.info("Estimated root_depth_50 as 50% of soil_depth_statgs0")
+            if 'soil_depth_statgso' in df.columns and df['soil_depth_statgso'].notna().any():
+                df['root_depth_50'] = df['soil_depth_statgso'] * 0.5
+                logger.info("Estimated root_depth_50 as 50% of soil_depth_statgso")
             elif 'root_depth_99' in df.columns and df['root_depth_99'].notna().any():
                 df['root_depth_50'] = df['root_depth_99'] * 0.5
                 logger.info("Estimated root_depth_50 as 50% of root_depth_99")
         
         return df
 
-    def _validate_paper_compliance(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """Validate that all paper-required static variables are present."""
+    def _validate_variable_completeness(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """Validate that all required static variables (numeric) are present."""
+        required_numeric = [v for v in self.REQUIRED_STATIC_VARS if v not in self.CATEGORICAL_VARS]
         validation_result = {
-            'total_required': len(self.PAPER_REQUIRED_VARIABLES),
+            'total_required': len(required_numeric),
             'present': [],
             'missing': [],
             'coverage': {},
             'all_present': True
         }
         
-        for var in self.PAPER_REQUIRED_VARIABLES:
+        for var in required_numeric:
             if var in df.columns:
                 validation_result['present'].append(var)
                 non_nan = df[var].notna().sum()
                 total = len(df)
                 validation_result['coverage'][var] = non_nan / total if total > 0 else 0.0
-                
                 if non_nan == 0:
                     validation_result['missing'].append(f"{var} (all NaN)")
                     validation_result['all_present'] = False
@@ -441,23 +490,20 @@ class AttributeLoader(BaseDataLoader):
         
         validation_result['present_count'] = len(validation_result['present'])
         validation_result['missing_count'] = len(validation_result['missing'])
-        
         return validation_result
 
-    def _log_paper_compliance(self, validation: Dict[str, Any]) -> None:
-        """Log paper compliance validation results."""
+    def _log_completeness(self, validation: Dict[str, Any]) -> None:
+        """Log variable completeness validation results."""
         if validation['all_present']:
-            logger.info(f"Paper Table 1 compliance: PASS - All {validation['total_required']} static variables present")
+            logger.info(f"Static variables completeness: PASS - All {validation['total_required']} numeric variables present")
         else:
-            logger.warning(f"Paper Table 1 compliance: FAIL - {validation['missing_count']}/{validation['total_required']} variables missing: {validation['missing']}")
+            logger.warning(f"Static variables completeness: FAIL - {validation['missing_count']}/{validation['total_required']} variables missing: {validation['missing']}")
         
-        # Log variables with low coverage
         low_coverage = {var: cov for var, cov in validation['coverage'].items() if cov < 0.8}
         if low_coverage:
             logger.warning(f"Static variables with low coverage (<80%): {low_coverage}")
 
     def _extract_huc_from_camels_name(self) -> Optional[pd.Series]:
-        """Extract HUC2 mapping from camels_name.txt if available."""
         possible_paths = [
             self.config.data_source_path / "camels_name.txt",
             self.config.data_source_path.parent / "camels_name.txt",
@@ -470,7 +516,6 @@ class AttributeLoader(BaseDataLoader):
                     name_df = pd.read_csv(name_file_path, delimiter=';')
                     logger.info(f"Loaded camels_name.txt from {name_file_path}")
                     
-                    # Fix column naming inconsistency
                     if 'gauge_id' in name_df.columns and 'gage_id' not in name_df.columns:
                         name_df = name_df.rename(columns={'gauge_id': 'gage_id'})
                         if logger.isEnabledFor(logging.DEBUG):
@@ -480,16 +525,9 @@ class AttributeLoader(BaseDataLoader):
                         logger.debug("camels_name.txt does not contain huc_02 column")
                         return None
                     
-                    # Format gage_id with batch method
                     name_df = self._format_gage_ids_batch(name_df, "camels_name.txt")
-                    
-                    # Create index series
-                    huc_series = pd.Series(
-                        name_df['huc_02'].values, 
-                        index=name_df['gage_id']
-                    )
+                    huc_series = pd.Series(name_df['huc_02'].values, index=name_df['gage_id'])
                     huc_series = huc_series.astype(str).str.zfill(2)
-                    
                     logger.info(f"Extracted HUC2 mapping from camels_name.txt: {len(huc_series)} records")
                     return huc_series
                     
@@ -501,14 +539,12 @@ class AttributeLoader(BaseDataLoader):
         return None
 
     def get_basin_attributes(self, gage_id: str) -> Dict[str, Any]:
-        """Get all attributes for a specific gage with paper compliance."""
+        """Get all attributes for a specific gage."""
         if not self.data or self.data.empty:
             logger.warning("Attributes not loaded yet")
             return {}
 
-        # Format the input gage_id to ensure 8-digit format
         formatted_gage_id = self._format_gage_id(gage_id)
-        
         gage_row = self.data[self.data['gage_id'] == formatted_gage_id]
         if gage_row.empty:
             logger.warning(f"No attributes found for gage {formatted_gage_id} (original: {gage_id})")
@@ -517,8 +553,8 @@ class AttributeLoader(BaseDataLoader):
         attrs = gage_row.iloc[0].to_dict()
         clean_attrs = {}
         
-        # Ensure all paper variables are included
-        for var in self.PAPER_REQUIRED_VARIABLES:
+        required_numeric = [v for v in self.REQUIRED_STATIC_VARS if v not in self.CATEGORICAL_VARS]
+        for var in required_numeric:
             if var in attrs:
                 value = attrs[var]
                 if isinstance(value, (np.integer, np.int64)):
@@ -532,18 +568,24 @@ class AttributeLoader(BaseDataLoader):
                 else:
                     clean_attrs[var] = value
             else:
-                logger.warning(f"Paper variable {var} missing for gage {formatted_gage_id}")
+                logger.warning(f"Required variable {var} missing for gage {formatted_gage_id}")
                 clean_attrs[var] = np.nan
+        
+        # Also include categorical original columns and one-hot encoded columns
+        for col in self.data.columns:
+            if col not in clean_attrs and col != 'gage_id' and col not in required_numeric:
+                clean_attrs[col] = attrs.get(col, np.nan)
         
         return clean_attrs
 
-    def get_paper_variables_summary(self) -> Dict[str, Any]:
-        """Get summary of paper-required variable coverage."""
+    def get_variables_summary(self) -> Dict[str, Any]:
+        """Get summary of required variable coverage (numeric only)."""
         if self.data is None or self.data.empty:
             return {}
         
+        required_numeric = [v for v in self.REQUIRED_STATIC_VARS if v not in self.CATEGORICAL_VARS]
         summary = {}
-        for var in self.PAPER_REQUIRED_VARIABLES:
+        for var in required_numeric:
             if var in self.data.columns:
                 coverage = self.data[var].notna().sum() / len(self.data)
                 summary[var] = {

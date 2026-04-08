@@ -86,7 +86,8 @@ class TrainingConfig:
 
     def __post_init__(self):
         """Validate training configuration"""
-        valid_optimizers = ['adam', 'sgd', 'rmsprop', 'adamw']
+        # Added 'adadelta' to the list of valid optimizers
+        valid_optimizers = ['adam', 'sgd', 'rmsprop', 'adamw', 'adadelta']
         if self.optimizer.lower() not in valid_optimizers:
             raise ValueError(f"Optimizer must be one of {valid_optimizers}")
 

@@ -1,6 +1,5 @@
 # Hydrological Multi-Task Learning with CGC - Default Configuration
 # Project: HydroMTL_CGC
-# Adapted to match actual netCDF variable names from output_591_basins/
 
 experiment:
   name: "cgc_hydro_experiment_001"
@@ -9,61 +8,107 @@ experiment:
   save_dir: "./experiments"
 
 data:
-  # Data source - point to your actual data directory
   dataset: "CAMELS_US_custom"
-  data_root: "./output_591_basins"
+  data_root: "./output_592_basins"
 
-  # Features configuration - exact variable names from netCDF files
   static_features:
+    # Terrain
     - "elev_mean"
     - "slope_mean"
     - "area_gages2"
+    # Land Cover
     - "frac_forest"
-    - "soil_depth_statgs0"    # renamed from soil_depth
+    - "lai_max"
+    - "lai_diff"
+    - "dom_land_cover_frac"
+    - "root_depth_50"
+    # Soil
+    - "soil_depth_statgso"
     - "soil_porosity"
+    - "soil_conductivity"
+    - "max_water_content"
+    # Geology
+    - "geol_porosity"
+    - "geol_permeability"
+    # One-hot encoded columns (add all from your nc file)
+    - "dom_land_cover_____Barren_or_Sparsely_Vegetated"
+    - "dom_land_cover_____Closed_Shrublands"
+    - "dom_land_cover_____Croplands"
+    - "dom_land_cover_____Deciduous_Broadleaf_Forest"
+    - "dom_land_cover_____Evergreen_Broadleaf_Forest"
+    - "dom_land_cover_____Evergreen_Needleleaf_Forest"
+    - "dom_land_cover_____Grasslands"
+    - "dom_land_cover_____Mixed_Forests"
+    - "dom_land_cover_____Open_Shrublands"
+    - "dom_land_cover_____Savannas"
+    - "dom_land_cover_____Woody_Savannas"
+    - "dom_land_cover_____croplandnatural_vegetation_mosaic"
+    - "geol_class_1st_Acid_plutonic_rocks"
+    - "geol_class_1st_Acid_volcanic_rocks"
+    - "geol_class_1st_Basic_plutonic_rocks"
+    - "geol_class_1st_Basic_volcanic_rocks"
+    - "geol_class_1st_Carbonate_sedimentary_rocks"
+    - "geol_class_1st_Intermediate_plutonic_rocks"
+    - "geol_class_1st_Intermediate_volcanic_rocks"
+    - "geol_class_1st_Metamorphics"
+    - "geol_class_1st_Mixed_sedimentary_rocks"
+    - "geol_class_1st_Pyroclastics"
+    - "geol_class_1st_Siliciclastic_sedimentary_rocks"
+    - "geol_class_1st_Unconsolidated_sediments"
+    - "geol_class_2nd_Acid_plutonic_rocks"
+    - "geol_class_2nd_Acid_volcanic_rocks"
+    - "geol_class_2nd_Basic_plutonic_rocks"
+    - "geol_class_2nd_Basic_volcanic_rocks"
+    - "geol_class_2nd_Carbonate_sedimentary_rocks"
+    - "geol_class_2nd_Intermediate_plutonic_rocks"
+    - "geol_class_2nd_Intermediate_volcanic_rocks"
+    - "geol_class_2nd_Metamorphics"
+    - "geol_class_2nd_Mixed_sedimentary_rocks"
+    - "geol_class_2nd_Pyroclastics"
+    - "geol_class_2nd_Siliciclastic_sedimentary_rocks"
+    - "geol_class_2nd_Unconsolidated_sediments"
+    - "geol_class_2nd_Water_bodies"
+    - "geol_class_2nd_missing"
 
   dynamic_features:
-    - "total_precipitation"   # renamed from prcp
-    - "temperature"           # renamed from tmax/tmin (single variable)
-    - "specific_humidity"     # renamed from vp
-    - "shortwave_radiation"   # renamed from srad
-    - "potential_energy"      # renamed from pet
+    - "total_precipitation"
+    - "temperature"
+    - "specific_humidity"
+    - "shortwave_radiation"
+    - "potential_energy"
 
-  # Targets - exact target variable names
   targets:
     - name: "streamflow"
       type: "regression"
       loss_weight: 1.0
       constraint: "non_negative"
-    - name: "evapotranspiration"   # renamed from et
+    - name: "evapotranspiration"
       type: "regression"
-      loss_weight: 0.8
+      loss_weight: 0.3333
       constraint: "non_negative"
 
-  # Time series parameters
-  sequence_length: 30
+  sequence_length: 365
   prediction_horizon: 1
   forecast_history: 365
 
-  # Data splits (adjust if your data does not cover these periods)
-  train_period: ["2001-10-01", "2011-10-01"]
-  val_period: ["2011-10-01", "2013-10-01"]
-  test_period: ["2013-10-01", "2016-10-01"]
+  train_period: ["2001-10-01", "2011-09-30"]
+  val_period: ["2011-10-01", "2016-09-30"]
+  test_period: ["2016-10-01", "2021-09-30"]
+  train_ratio: 0.7
+  val_ratio: 0.15
 
-  # Processing
   normalize: true
   fill_missing: true
   batch_size: 32
   num_workers: 0
 
 model:
-  # CGC Architecture - unchanged
   cgc:
-    shared_experts: 6
-    task_experts: [4, 3]
-    expert_hidden_dim: 128
+    shared_experts: 8
+    task_experts: [5, 4]
+    expert_hidden_dim: 256
     use_attention_gate: true
-    dropout_rate: 0.2
+    dropout_rate: 0
 
   encoder:
     type: "cnn"
@@ -73,36 +118,43 @@ model:
 
   task_towers:
     - type: "lstm"
-      hidden_dim: 128
-      num_layers: 1
+      hidden_dim: 256
+      num_layers: 2
       output_head: "regression"
     - type: "lstm"
-      hidden_dim: 128
-      num_layers: 1
+      hidden_dim: 256
+      num_layers: 2
       output_head: "regression"
 
   physics_constraints:
     water_balance:
-      enabled: true
+      enabled: false
       alpha: 0.1
       requires_precipitation: true
 
 training:
-  optimizer: "adam"
-  learning_rate: 0.001
-  weight_decay: 0.0001
-  clip_grad_norm: 1.0
+  optimizer: "adadelta"
+  learning_rate: 1.0
+  weight_decay: 0.0
+  clip_grad_norm: 0
 
   loss:
     base_loss: "mse"
-    multi_task_balancing: "uncertainty"
-    water_balance_weight: 0.1
+    multi_task_balancing: "none"
+    water_balance_weight: 0
 
-  epochs: 300
-  warmup_epochs: 10
+  scheduler:
+    type: "reduce_on_plateau"
+    mode: "min"
+    factor: 0.5
+    patience: 10
+    min_lr: 1e-6
+
+  epochs: 100
+  warmup_epochs: 0
   patience: 30
 
-  dropout: 0.2
+  dropout: 0.0
   batch_norm: true
 
   save_frequency: 10
@@ -114,7 +166,7 @@ evaluation:
     - "kge"
     - "rmse"
     - "mae"
-    - "pbias"
+    - "bias"
     - "r2"
 
   plot_predictions: true

@@ -21,7 +21,7 @@ class StreamflowLoader:
         self.config = config
         self.data_source_path = config.data_source_path
         self.data_source_type = "camels"
-        logger.debug(f"StreamflowLoader initialized for {self.data_source_path}")
+        logger.info(f"StreamflowLoader initialized for {self.data_source_path}")
 
         self.huc_mapping: Dict[str, str] = {}
         self._load_huc_mapping()
@@ -84,14 +84,15 @@ class StreamflowLoader:
                 if gage_data is not None and not gage_data.empty:
                     all_data.append(gage_data)
                     successful_gages.append(gage_id)
+                    logger.debug(f"Loaded streamflow for gage {gage_id}")
             except Exception as e:
-                logger.warning(f"Failed to load streamflow for gage {gage_id}: {e}")
+                logger.debug(f"Failed to load streamflow for gage {gage_id}: {e}")
 
         if not all_data:
             logger.error("No valid streamflow data loaded")
             return None
 
-        logger.info(f"Loaded streamflow for {len(successful_gages)} gages")
+        logger.debug(f"Loaded streamflow for {len(successful_gages)} gages")
         return pd.concat(all_data, ignore_index=True)
 
     def _load_single_gage(self, gage_id: str, huc2: str = None) -> Optional[pd.DataFrame]:
@@ -100,17 +101,16 @@ class StreamflowLoader:
             huc2 = self._get_huc_for_gage(gage_id)
 
         if not huc2:
-            logger.debug(f"No HUC2 mapping found for gage {gage_id}")
             huc2 = self._find_huc_by_scanning(gage_id)
 
         if not huc2:
-            logger.warning(f"Could not find streamflow data for gage {gage_id}")
+            logger.debug(f"No HUC2 mapping found for gage {gage_id}")
             return None
 
         file_path = self._build_file_path(gage_id, huc2)
 
         if not file_path.exists():
-            logger.warning(f"Streamflow file not found: {file_path}")
+            logger.debug(f"Streamflow file not found: {file_path}")
             return None
 
         try:

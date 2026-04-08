@@ -7,6 +7,7 @@ import os
 import sys
 import argparse
 import logging
+import random
 from pathlib import Path
 from typing import Dict, Any
 
@@ -14,6 +15,17 @@ import torch
 import torch.nn as nn
 import numpy as np
 import yaml
+
+# Set random seeds for reproducibility
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(42)
 
 # Add the parent directory of mtl_cgc to Python path
 project_root = Path(__file__).parent.parent
@@ -139,11 +151,16 @@ def load_data(config: Dict[str, Any]) -> Dict[str, Any]:
         if loader is not None:
             logger.info(f"  {split}: {len(loader.dataset)} samples")
 
+    basin_scalers = data_loaders.get('basin_scalers', None)
+    if basin_scalers is None:
+        logger.warning("No basin_scalers found in data_loaders. Inverse transform may fail.")
+
     return {
         'loaders': data_loaders,
         'basin_ids': basin_ids,
         'feature_names': config.data.static_features + config.data.dynamic_features,
-        'target_names': [t['name'] for t in config.data.targets]
+        'target_names': [t['name'] for t in config.data.targets],
+        'basin_scalers': basin_scalers
     }
 
 
@@ -208,12 +225,44 @@ def train_model(model: HydroMTL_CGC, data: Dict[str, Any],
     # Setup device
     device = torch.device(getattr(config.training, 'device', 'cuda' if torch.cuda.is_available() else 'cpu'))
 
+    # ========== Normalization check (streaming, full dataset) ==========
+    print("\n"+" Checking normalization of training targets ".center(80, "="))
+    train_loader = data['loaders']['train']
+    sum_sf = 0.0; sum_sf_sq = 0.0; cnt_sf = 0
+    sum_et = 0.0; sum_et_sq = 0.0; cnt_et = 0
+    for batch in train_loader:
+        sf = batch['streamflow'].cpu().numpy().flatten()
+        et = batch['evapotranspiration'].cpu().numpy().flatten()
+        m_sf = ~np.isnan(sf)
+        m_et = ~np.isnan(et)
+        if m_sf.any():
+            v = sf[m_sf]
+            sum_sf += v.sum()
+            sum_sf_sq += (v ** 2).sum()
+            cnt_sf += len(v)
+        if m_et.any():
+            v = et[m_et]
+            sum_et += v.sum()
+            sum_et_sq += (v ** 2).sum()
+            cnt_et += len(v)
+    if cnt_sf > 0:
+        mean_sf = sum_sf / cnt_sf
+        std_sf = np.sqrt(sum_sf_sq / cnt_sf - mean_sf ** 2)
+        print(f"Train streamflow (standardized) - mean: {mean_sf:.4f}, std: {std_sf:.4f}")
+    if cnt_et > 0:
+        mean_et = sum_et / cnt_et
+        std_et = np.sqrt(sum_et_sq / cnt_et - mean_et ** 2)
+        print(f"Train ET (standardized) - mean: {mean_et:.4f}, std: {std_et:.4f}")
+    print("=" * 80 + "\n")
+    # ========== End normalization check ==========
+
     # Setup trainer
     trainer = HydroTrainer(
         model=model,
         config=config,
         device=device,
-        use_wandb=config.logging.get('wandb', False)
+        use_wandb=config.logging.get('wandb', False),
+        basin_scalers=data.get('basin_scalers')
     )
 
     # Train model
