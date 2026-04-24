@@ -1,6 +1,6 @@
 """
 Main pipeline for Hydro Data Processing.
-Includes static attribute validation, coverage checks, and summary.
+Includes static attribute validation, coverage checks, summary, and categorical encoding.
 """
 
 import pandas as pd
@@ -36,9 +36,12 @@ class HydroDataPipeline:
         'frac_forest', 'lai_max', 'lai_diff', 'dom_land_cover_frac',
         'root_depth_50', 'soil_depth_statgso', 'soil_porosity',
         'soil_conductivity', 'max_water_content',
-        'geol_porosity', 'geol_permeability'
-        # 'dom_land_cover', 'geol_class_1st', 'geol_class_2nd'  # 已删除
+        'geol_porosity', 'geol_permeability',
+        'sand_frac', 'clay_frac', 'organic_frac', 'carbonate_rocks_frac',
+        'p_mean', 'pet_mean', 'aridity', 'p_seasonality', 'frac_snow'
     ]
+    
+    REQUIRED_CATEGORICAL_STATIC = ['dom_land_cover', 'geol_class_1st', 'geol_class_2nd']
 
     REQUIRED_DYNAMIC = [
         'total_precipitation', 'temperature', 'specific_humidity',
@@ -192,6 +195,17 @@ class HydroDataPipeline:
             attributes_df = attributes_df.head(self.config.max_basins)
 
         attributes_df['gage_id'] = attributes_df['gage_id'].astype(str).str.zfill(8)
+        
+        # --- GLOBAL CATEGORICAL ENCODING ---
+        logger.info("Encoding categorical static features into contiguous integers...")
+        for cat_col in self.REQUIRED_CATEGORICAL_STATIC:
+            if cat_col in attributes_df.columns:
+                # Convert to category and extract integer codes. 
+                # Add 1 so valid categories start from 1, and NaNs (originally -1) become 0.
+                attributes_df[cat_col] = attributes_df[cat_col].astype('category').cat.codes + 1
+                logger.info(f"  - Successfully encoded '{cat_col}' into contiguous IDs.")
+        # -----------------------------------
+
         gage_ids = attributes_df['gage_id'].tolist()
         logger.info(f"Step 2: Processing {len(gage_ids)} gages")
 
@@ -308,34 +322,45 @@ class HydroDataPipeline:
         return coverage
 
     def _save_dataset(self, data_df: pd.DataFrame, gage_attrs: Dict, gage_id: str,
-                    static_check: Dict, coverage: Dict) -> bool:
+                      static_check: Dict, coverage: Dict) -> bool:
         try:
             gage_id_8 = str(gage_id).zfill(8)
             self.config.output_dir.mkdir(parents=True, exist_ok=True)
             if 'date' in data_df.columns:
                 data_df = data_df.rename(columns={'date': 'time'})
             data_df = data_df.set_index('time')
+            
             ds = data_df.to_xarray()
 
-            # Add static attributes as data variables (skip gage_id and huc_02, they go to global attrs)
             for var_name, value in gage_attrs.items():
-                # Skip gage_id and huc_02 (they will be added as global attributes)
-                if var_name in ['gage_id', 'huc_02']:
+                if var_name in ['gage_id', 'huc_02'] or var_name in ds.coords or var_name in ds.data_vars:
                     continue
-                # Skip if already present in dataset (e.g., time coordinate)
-                if var_name in ds.coords or var_name in ds.data_vars:
-                    continue
-                # Skip NaN values
-                if pd.isna(value):
-                    continue
-                # Convert to float if possible
-                try:
-                    val = float(value)
+                
+                # --- SAFE CATEGORICAL ASSIGNMENT ---
+                if var_name in self.REQUIRED_CATEGORICAL_STATIC:
+                    try:
+                        # Fallback to 0 (Unknown) if value is missing or invalid. NEVER use -1.
+                        val = int(value) if not pd.isna(value) else 0
+                    except (TypeError, ValueError):
+                        val = 0
                     ds[var_name] = val
-                except (TypeError, ValueError):
-                    logger.debug(f"Cannot convert {var_name}={value} to float, skipping")
+                # -----------------------------------
+                else:
+                    if pd.isna(value):
+                        ds[var_name] = np.nan
+                    else:
+                        try:
+                            ds[var_name] = float(value)
+                        except (TypeError, ValueError):
+                            logger.debug(f"Cannot convert {var_name}={value} to float, skipping")
 
-            # Add global attributes (including gage_id and huc_02)
+            for var_name in list(ds.variables):
+                if var_name == 'time':
+                    continue
+                if ds[var_name].dtype.kind in 'iu':
+                    ds[var_name] = ds[var_name].astype('float32')
+                    logger.debug(f"[{gage_id}] Converted integer '{var_name}' to float32")
+
             ds.attrs.update({
                 'title': 'Hydro-Meteorological Dataset',
                 'gage_id': gage_id_8,
@@ -347,12 +372,10 @@ class HydroDataPipeline:
                 'streamflow_coverage': float(coverage.get('streamflow', 0.0))
             })
 
-            # Add variable attributes for dynamic variables
             for var in self.REQUIRED_DYNAMIC:
                 if var in ds:
                     ds[var].attrs['missing_value'] = -999.0
 
-            # Encoding
             encoding = {}
             if 'time' in ds.coords:
                 encoding['time'] = {
@@ -443,7 +466,6 @@ class HydroDataPipeline:
         logger.info(f"Success rate: {summary['processing_stats']['success_rate']:.1%}")
         logger.info("=" * 60)
 
-    # ---------- Helper methods ----------
     def _get_gage_attributes(self, gage_id: str, attributes_df: pd.DataFrame) -> Dict:
         gage_id_8 = gage_id.zfill(8)
         row = attributes_df[attributes_df['gage_id'].astype(str) == gage_id_8]
@@ -457,11 +479,9 @@ class HydroDataPipeline:
             if isinstance(v, (np.integer, np.int64)):
                 clean[k] = int(v)
             elif isinstance(v, (np.floating, np.float64)):
-                clean[k] = float(v)
+                clean[k] = float(v) if not pd.isna(v) else np.nan
             elif isinstance(v, np.ndarray):
                 clean[k] = v.tolist()
-            elif pd.isna(v):
-                continue
             else:
                 clean[k] = v
         return clean
@@ -471,13 +491,19 @@ class HydroDataPipeline:
         if gage_id_8 in self.huc2_mapping:
             return str(self.huc2_mapping[gage_id_8]).zfill(2)
         if 'huc_02' in gage_attrs and gage_attrs['huc_02']:
-            return str(gage_attrs['huc_02']).zfill(2)
+            try:
+                return str(int(float(gage_attrs['huc_02']))).zfill(2)
+            except (ValueError, TypeError):
+                return str(gage_attrs['huc_02']).zfill(2)
         return None
 
     def _load_streamflow_with_huc2(self, gage_id: str, huc2: str) -> Optional[pd.DataFrame]:
         try:
             camels = None
             usgs = None
+            start_date = self.config.processing_config.start_date
+            end_date = self.config.processing_config.end_date
+            
             if self.camels_streamflow_loader:
                 camels = self.camels_streamflow_loader.load([gage_id], huc2=huc2)
                 if camels is not None and not camels.empty:
@@ -486,6 +512,7 @@ class HydroDataPipeline:
                 usgs = self.usgs_streamflow_loader.load([gage_id], huc2=huc2)
                 if usgs is not None and not usgs.empty:
                     usgs = usgs[(usgs['date'] >= '2015-01-01') & (usgs['date'] <= '2021-09-30')]
+            
             combined = []
             if camels is not None and not camels.empty:
                 combined.append(camels)
@@ -493,10 +520,10 @@ class HydroDataPipeline:
                 combined.append(usgs)
             if not combined:
                 return None
+                
             df = pd.concat(combined, ignore_index=True).sort_values('date').drop_duplicates('date')
-            full = pd.DataFrame({'date': pd.date_range('2001-01-01', '2021-09-30', freq='D')})
+            full = pd.DataFrame({'date': pd.date_range(start_date, end_date, freq='D')})
             merged = pd.merge(full, df[['date', 'streamflow']], on='date', how='left')
-            logger.debug(f"Gage {gage_id}: loaded {len(df)} records, coverage {merged['streamflow'].notna().mean():.2%}")
             return merged
         except Exception as e:
             logger.warning(f"Error loading streamflow for {gage_id}: {e}")
