@@ -42,7 +42,7 @@ log/
 
 # Output directories
 output/
-output_591_basins/
+output_592_basins/
 *.nc
 
 # Jupyter

@@ -1,218 +1,119 @@
+# ==============================================================================
+# Copyright (c) 2024-2025. All Rights Reserved.
+# Author: Mochen & Project Contributors
+# Description: Main Multi-Task Learning Architecture (HydroMTL_CGC).
+# Implements physical data safeguards and handles multi-layer representations.
+# ==============================================================================
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Dict, Optional
-import logging
-
+from typing import Dict, Tuple
 from .cgc_layer import CGCLayer
-from .heads import RegressionHead
-
-logger = logging.getLogger(__name__)
-
-class FeatureEncoder(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int = 256, 
-                 num_layers: int = 1, bidirectional: bool = False,
-                 encoder_type: str = "lstm", dropout_rate: float = 0.5):
-        super().__init__()
-        self.encoder_type = encoder_type.lower()
-        self.hidden_dim = hidden_dim
-        self.bidirectional = bidirectional
-        
-        self.input_projection = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate)
-        )
-        
-        if self.encoder_type == "lstm":
-            self.encoder = nn.LSTM(
-                input_size=256,
-                hidden_size=hidden_dim,
-                num_layers=num_layers,
-                bidirectional=bidirectional,
-                batch_first=True
-            )
-            self.output_dim = hidden_dim * (2 if bidirectional else 1)
-        elif self.encoder_type == "gru":
-            self.encoder = nn.GRU(
-                input_size=256,
-                hidden_size=hidden_dim,
-                num_layers=num_layers,
-                bidirectional=bidirectional,
-                batch_first=True
-            )
-            self.output_dim = hidden_dim * (2 if bidirectional else 1)
-        else:
-            raise ValueError(f"Unsupported encoder type: {encoder_type}")
-        
-        self.layer_norm = nn.LayerNorm(self.output_dim)
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.input_projection(x)
-        
-        if self.encoder_type in ["lstm", "gru"]:
-            encoded, _ = self.encoder(x)
-            if self.bidirectional:
-                forward_last = encoded[:, -1, :self.hidden_dim]
-                backward_first = encoded[:, 0, self.hidden_dim:]
-                encoded_features = torch.cat([forward_last, backward_first], dim=-1)
-            else:
-                encoded_features = encoded[:, -1, :]
-        
-        encoded_features = self.layer_norm(encoded_features)
-        return encoded_features
-
-class TaskTower(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int = 128,
-                 num_layers: int = 1, tower_type: str = "mlp",
-                 output_head_type: str = "regression",
-                 output_dim: int = 1, dropout: float = 0.5):
-        super().__init__()
-        self.tower_type = tower_type.lower()
-        self.output_head_type = output_head_type
-        
-        if self.tower_type != "mlp":
-            logger.warning("Overriding tower_type to 'mlp' for task consistency.")
-            self.tower_type = "mlp"
-            
-        layers = []
-        current_dim = input_dim
-        for _ in range(num_layers):
-            layers.append(nn.Linear(current_dim, hidden_dim))
-            layers.append(nn.BatchNorm1d(hidden_dim))
-            layers.append(nn.ReLU())
-            layers.append(nn.Dropout(dropout))
-            current_dim = hidden_dim
-        
-        self.tower_layers = nn.Sequential(*layers) if layers else nn.Identity()
-        self.output_head = RegressionHead(hidden_dim, output_dim)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        features = self.tower_layers(x)
-        predictions = self.output_head(features)
-        return predictions
+from .heads import get_head
 
 class HydroMTL_CGC(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: Dict):
         super().__init__()
-        self.config = config
         data_cfg = config.get('data', {})
-        model_cfg = config.get('model', config)
+        model_cfg = config.get('model', {})
         
-        self.num_tasks = len(model_cfg.get('task_towers', []))
-        if self.num_tasks == 0:
-            raise ValueError("No task_towers found in configuration.")
-            
-        self.categorical_features = data_cfg.get('categorical_static_features', [])
-        self.categorical_embeddings = nn.ModuleDict()
-        total_cat_embed_dim = 0
+        self.targets = data_cfg.get('targets', [])
+        self.task_names =[str(t.get('name', '')).lower() for t in self.targets]
+        self.num_tasks = len(self.task_names)
         
-        for feat in self.categorical_features:
-            num_classes = data_cfg.get('categorical_num_classes', {}).get(feat, 150)
-            embed_dim = data_cfg.get('categorical_embed_dims', {}).get(feat, 8)
-            self.categorical_embeddings[feat] = nn.Embedding(num_classes + 1, embed_dim, padding_idx=0)
-            nn.init.normal_(self.categorical_embeddings[feat].weight, mean=0.0, std=0.1)
-            total_cat_embed_dim += embed_dim
+        dyn_features = data_cfg.get('dynamic_features',[])
+        stat_features = data_cfg.get('static_features',[])
         
-        num_numerical_features = len(data_cfg.get('static_features', [])) + \
-                                 len(data_cfg.get('dynamic_features', []))
+        enc_cfg = model_cfg.get('encoder', {})
+        self.lstm = nn.LSTM(
+            input_size=len(dyn_features), 
+            hidden_size=enc_cfg.get('hidden_dim', 256), 
+            num_layers=enc_cfg.get('num_layers', 2),
+            bidirectional=enc_cfg.get('bidirectional', False),
+            batch_first=True
+        )
+        lstm_out_dim = enc_cfg.get('hidden_dim', 256) * (2 if enc_cfg.get('bidirectional', False) else 1)
         
-        encoder_config = model_cfg['encoder']
-        cgc_config = model_cfg['cgc']
+        self.cat_features = data_cfg.get('categorical_static_features',[])
+        self.embs = nn.ModuleList()
+        total_emb_dim = 0
         
-        self.encoder = FeatureEncoder(
-            input_dim=num_numerical_features,
-            hidden_dim=encoder_config['hidden_dim'],
-            num_layers=encoder_config['num_layers'],
-            bidirectional=encoder_config.get('bidirectional', False),
-            encoder_type=encoder_config['type'],
-            dropout_rate=cgc_config.get('dropout_rate', 0.5)
+        if self.cat_features:
+            num_classes_dict = data_cfg.get('categorical_num_classes', {})
+            emb_dims_dict = data_cfg.get('categorical_embed_dims', {})
+            for cat_name in self.cat_features:
+                num_c = num_classes_dict.get(cat_name, 20)
+                dim_e = emb_dims_dict.get(cat_name, 8)
+                self.embs.append(nn.Embedding(num_embeddings=num_c + 1, embedding_dim=dim_e, padding_idx=0))
+                total_emb_dim += dim_e
+                
+        s_dim = model_cfg.get('cgc', {}).get('static_dim', len(stat_features))
+        self.s_mlp = nn.Sequential(
+            nn.Linear(s_dim + total_emb_dim, 128), 
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Dropout(model_cfg.get('cgc', {}).get('dropout_rate', 0.3))
         )
         
-        cgc_input_dim = self.encoder.output_dim + total_cat_embed_dim
+        cgc_cfg = model_cfg.get('cgc', {})
+        n_shared = cgc_cfg.get('shared_experts', 4)
+        expert_dim = cgc_cfg.get('expert_hidden_dim', 256)
         
-        self.cgc_layer = CGCLayer(
-            input_dim=cgc_input_dim,
-            output_dim=cgc_config['expert_hidden_dim'],
-            num_shared_experts=cgc_config['shared_experts'],
-            num_task_experts=cgc_config['task_experts'],
-            use_attention_gate=cgc_config.get('use_attention_gate', True),
-            dropout_rate=cgc_config.get('dropout_rate', 0.5)
-        )
-        
-        self.task_towers = nn.ModuleList()
-        for tower_config in model_cfg['task_towers']:
-            tower = TaskTower(
-                input_dim=cgc_config['expert_hidden_dim'],
-                hidden_dim=tower_config['hidden_dim'],
-                num_layers=tower_config['num_layers'],
-                tower_type=tower_config.get('type', 'mlp'),
-                output_head_type=tower_config.get('output_head', 'regression'),
-                output_dim=data_cfg.get('prediction_horizon', 1),
-                dropout=cgc_config.get('dropout_rate', 0.5)
-            )
-            self.task_towers.append(tower)
-        
-        self.physics_config = model_cfg.get('physics_constraints', {})
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        for name, param in self.named_parameters():
-            if 'categorical_embeddings' in name:
-                continue 
-            if 'weight' in name and param.dim() > 1:
-                if 'lstm' in name or 'gru' in name:
-                    nn.init.orthogonal_(param)
-                else:
-                    nn.init.xavier_uniform_(param)
-            elif 'bias' in name:
-                nn.init.constant_(param, 0)
-    
-    def forward(self, x: torch.Tensor, categorical_features: Optional[torch.Tensor] = None,
-                return_gate_analysis: bool = False) -> Dict[str, torch.Tensor]:
-        
-        encoded_time_features = self.encoder(x)
-        
-        if categorical_features is not None and len(self.categorical_features) > 0:
-            cat_embeds = []
-            for i, feat in enumerate(self.categorical_features):
-                idx = categorical_features[:, i] if categorical_features.dim() == 2 else categorical_features[:, 0, i]
-                cat_embeds.append(self.categorical_embeddings[feat](idx))
-            cat_concat = torch.cat(cat_embeds, dim=-1)
-            cat_concat = F.dropout(cat_concat, p=0.3, training=self.training)
-            combined_features = torch.cat([encoded_time_features, cat_concat], dim=-1)
+        raw_n_task_list = cgc_cfg.get('task_experts',[4, 2])
+        if len(raw_n_task_list) < self.num_tasks:
+            self.n_task_list = list(raw_n_task_list) + [1] * (self.num_tasks - len(raw_n_task_list))
+        elif len(raw_n_task_list) > self.num_tasks:
+            self.n_task_list = list(raw_n_task_list)[:self.num_tasks]
         else:
-            combined_features = encoded_time_features
-        
-        cgc_outputs = self.cgc_layer(combined_features)
-        
-        predictions = {}
-        for i, (cgc_out, tower) in enumerate(zip(cgc_outputs, self.task_towers)):
-            task_pred = tower(cgc_out)
-            task_name = self.config['data']['targets'][i]['name']
-            predictions[task_name] = task_pred['y_hat'] if isinstance(task_pred, dict) else task_pred
-        
-        if return_gate_analysis:
-            predictions['gate_analysis'] = self.cgc_layer.get_gate_analysis(combined_features)
+            self.n_task_list = list(raw_n_task_list)
             
-        return predictions
-    
-    def apply_physics_constraints(self, predictions: Dict[str, torch.Tensor],
-                                  precipitation: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-        if not self.physics_config.get('enabled', False):
-            return predictions
+        self.cgc = CGCLayer(
+            in_dim=lstm_out_dim + 128, 
+            out_dim=expert_dim, 
+            n_shared=n_shared, 
+            n_task_list=self.n_task_list, 
+            drop=cgc_cfg.get('dropout_rate', 0.3)
+        )
         
-        constrained_predictions = predictions.copy()
-        for task_name, pred in predictions.items():
-            if task_name in ['streamflow', 'et', 'usgsFlow', 'ET']:
-                constrained_predictions[task_name] = torch.relu(pred)
+        tower_cfgs = model_cfg.get('task_towers',[])
+        self.towers = nn.ModuleList()
         
-        water_balance_config = self.physics_config.get('water_balance', {})
-        if (water_balance_config.get('enabled', False) and precipitation is not None and
-            'streamflow' in predictions and 'evapotranspiration' in predictions):
-            streamflow_pred = predictions['streamflow']
-            et_pred = predictions['evapotranspiration']
-            water_imbalance = precipitation - streamflow_pred - et_pred
-            constrained_predictions['water_imbalance'] = water_imbalance
+        for i in range(self.num_tasks):
+            t_cfg = tower_cfgs[i] if i < len(tower_cfgs) else {'hidden_dim': 128, 'output_head': 'regression'}
+            self.towers.append(nn.Sequential(
+                nn.Linear(expert_dim, t_cfg.get('hidden_dim', 128)), 
+                nn.LayerNorm(t_cfg.get('hidden_dim', 128)),
+                nn.ReLU(), 
+                get_head(t_cfg.get('output_head', 'regression'), t_cfg.get('hidden_dim', 128))
+            ))
+
+    def forward(self, dyn_x: torch.Tensor, stat_num: torch.Tensor, stat_cat: torch.Tensor = None) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        dyn_x = torch.clamp(dyn_x, -20.0, 20.0)
+        stat_num = torch.clamp(stat_num, -20.0, 20.0)
+
+        self.lstm.flatten_parameters()
+        _, (h_n, _) = self.lstm(dyn_x)
         
-        return constrained_predictions
+        if self.lstm.bidirectional:
+            d_repr = torch.cat((h_n[-2,:,:], h_n[-1,:,:]), dim=1)
+        else:
+            d_repr = h_n[-1,:,:]
+            
+        d_repr = torch.nan_to_num(d_repr, nan=0.0)
+        
+        if self.cat_features and stat_cat is not None:
+            c_repr = torch.cat([emb(stat_cat[:, i].long()) for i, emb in enumerate(self.embs)], dim=-1)
+            s_input = torch.cat([stat_num, c_repr], dim=-1)
+        else:
+            s_input = stat_num
+            
+        s_repr = self.s_mlp(s_input)
+        
+        cgc_input = torch.cat([d_repr, s_repr], dim=-1)
+        cgc_input = torch.nan_to_num(cgc_input, nan=0.0)
+        
+        cgc_outs, gate_weights = self.cgc(cgc_input)
+        
+        preds_dict = {name: tower(torch.nan_to_num(out, nan=0.0)) for name, tower, out in zip(self.task_names, self.towers, cgc_outs)}
+        
+        return preds_dict, gate_weights

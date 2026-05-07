@@ -1,3 +1,9 @@
+# ==============================================================================
+# Configuration File for HydroMTL_CGC Framework
+# Description: Defines hyper-parameters, data splits, and model architectures.
+# Adapted for Large-Sample Hydrological Modeling (e.g., CAMELS datasets).
+# ==============================================================================
+
 experiment:
   name: "cgc_hydro_experiment_001"
   task: "streamflow_et_prediction"
@@ -60,6 +66,7 @@ data:
     geol_class_2nd: 8
     huc_02: 12
 
+  # Dynamic meteorological forcing features
   dynamic_features:
     - "total_precipitation"
     - "temperature"
@@ -77,10 +84,12 @@ data:
       loss_weight: 0.33
       constraint: "non_negative"
 
+  # Sequence and forecasting settings
   sequence_length: 365
   prediction_horizon: 1
   forecast_history: 365
 
+  # Temporal split for train/valid/test
   train_period: ["2001-10-01", "2011-09-30"]
   val_period: ["2011-10-01", "2016-09-30"]
   test_period: ["2016-10-01", "2021-09-30"]
@@ -89,32 +98,32 @@ data:
 
   normalize: true
   fill_missing: true
-  batch_size: 256
+  batch_size: 100
   num_workers: 16
   prefetch_factor: 4
 
 model:
   cgc:
-    shared_experts: 2
-    task_experts: [2, 1]
-    expert_hidden_dim: 128
+    shared_experts: 4
+    task_experts: [4, 2]
+    expert_hidden_dim: 256
     use_attention_gate: true
-    dropout_rate: 0.5
+    dropout_rate: 0.3
 
   encoder:
     type: "lstm"
     hidden_dim: 256
-    num_layers: 1
+    num_layers: 2
     bidirectional: false
 
   task_towers:
     - type: "mlp"
       hidden_dim: 128
-      num_layers: 1
+      num_layers: 2
       output_head: "regression"
     - type: "mlp"
       hidden_dim: 128
-      num_layers: 1
+      num_layers: 2
       output_head: "regression"
 
   physics_constraints:
@@ -126,11 +135,11 @@ model:
 training:
   optimizer: "adamw"
   learning_rate: 0.001
-  weight_decay: 0.001
+  weight_decay: 0.05
   clip_grad_norm: 1.0
 
   loss:
-    base_loss: "mse"
+    base_loss: "rmse"
     multi_task_balancing: "none"
     water_balance_weight: 0
 
@@ -138,12 +147,16 @@ training:
     type: "reduce_on_plateau"
     mode: "min"
     factor: 0.5
-    patience: 10
+    patience: 5
     min_lr: 1e-6
 
-  epochs: 100
+  epochs: 300
   warmup_epochs: 0
-  patience: 15
+  
+  early_stopping:
+    enabled: true
+    patience: 15     
+    min_delta: 1e-4
 
   dropout: 0.5
   batch_norm: true

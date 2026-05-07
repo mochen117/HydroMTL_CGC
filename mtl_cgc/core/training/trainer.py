@@ -1,563 +1,602 @@
+# ==============================================================================
+# Copyright (c) 2024-2026. All Rights Reserved.
+# Description: Advanced Model Trainer for Hydrological MTL Framework.
+# Features: Masked RMSE computation, Mixed Precision Training (AMP), 
+# robust progress bar management, and comprehensive TensorBoard tracking.
+# ==============================================================================
+
+import sys
+from pathlib import Path
+from typing import Dict, Tuple, Optional, Any, Union, List
+
+import numpy as np
+from tqdm import tqdm
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
-import numpy as np
-from typing import Dict, List, Tuple, Optional, Any
-import time
-import logging
-import sys
-from pathlib import Path
-import wandb
-from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
+from torch.cuda.amp import autocast, GradScaler
 
-from mtl_cgc.utils.logger import setup_logger
-from .losses import get_loss_function
-from .metrics import compute_metrics
-from .callbacks import EarlyStopping, ModelCheckpoint, LearningRateScheduler
+from mtl_cgc.core.evaluation.metrics import compute_metrics
+try:
+    from mtl_cgc.core.training.callbacks import (
+        EarlyStopping, 
+        ModelCheckpoint, 
+        LearningRateScheduler, 
+        CallbackHandler
+    )
+except ImportError:
+    pass
 
-logger = setup_logger(__name__)
-if not logger.handlers:
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    formatter = logging.Formatter('%(message)s')
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
-    logger.propagate = False
 
-def masked_mse(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    pred = pred.squeeze()
+def masked_rmse(pred: Union[torch.Tensor, Dict], target: torch.Tensor) -> torch.Tensor:
+    """
+    Robust Masked Root Mean Squared Error Loss.
+    Safely ignores NaNs, prevents extreme gradient explosions via clamping,
+    and adds epsilon to sqrt to prevent NaN gradients near zero.
+    """
+    if isinstance(pred, dict) and 'means' in pred:
+        val = torch.sum(pred['means'].squeeze(-1) * pred['weights'], dim=1)
+    else:
+        val = pred.squeeze()
+        
     target = target.squeeze()
-    mask = ~torch.isnan(target)
+    
+    if val.shape != target.shape:
+        try:
+            val = val.view_as(target)
+        except Exception:
+            pass 
+            
+    mask = torch.isfinite(target) & torch.isfinite(val)
     if mask.sum() == 0:
-        return torch.tensor(float('nan'), device=pred.device)
-    return torch.nn.functional.mse_loss(pred[mask], target[mask])
+        return (torch.nan_to_num(val) * 0.0).sum()
+        
+    diff = torch.clamp(val[mask] - target[mask], min=-1000.0, max=1000.0)
+    mse_loss = torch.mean(diff ** 2)
+    return torch.sqrt(mse_loss + 1e-8)
+
 
 class HydroTrainer:
-    def __init__(self, model: nn.Module, config: Any, device: torch.device,
-                 use_wandb: bool = False, basin_scalers=None):
-        self.model = model
+    """
+    Orchestrates the training, validation, and testing loops.
+    Expected Model Forward Signature:
+        forward(...) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]
+        (Predictions Dictionary, Gate Weights Dictionary)
+    """
+    def __init__(
+        self, 
+        model: nn.Module, 
+        config: Any, 
+        device: torch.device,
+        criterion: Optional[nn.Module] = None,
+        scaler: Any = None,
+        use_wandb: bool = False,
+        basin_scalers: Optional[List] = None
+    ):
+        self.model = model.to(device)
         self.config = config
         self.device = device
+        self.criterion = criterion
+        self.scaler = scaler
         self.use_wandb = use_wandb
         self.basin_scalers = basin_scalers
-        self.model = self.model.to(device)
 
-        self.task_names = [t['name'] for t in self.config.data.targets]
-        self.task_weights = {t['name']: float(t.get('loss_weight', 1.0)) for t in self.config.data.targets}
+        # Parse task configurations
+        self.targets_cfg = self.config.data.get('targets', [])
+        self.task_names =[str(t.get('name', '')).lower() for t in self.targets_cfg]
+        self.task_weights = {str(t.get('name', '')).lower(): float(t.get('loss_weight', 1.0)) for t in self.targets_cfg}
         
-        self.optimizer = self._setup_optimizer()
-        self.lr_scheduler = self._setup_scheduler()
-        self.callbacks = self._setup_callbacks()
-
+        # Training parameters
+        self.clip_grad_norm = float(getattr(self.config.training, 'clip_grad_norm', 1.0))
+        self.use_amp = getattr(self.config.training, 'use_amp', False)
+        self.amp_scaler = GradScaler(enabled=self.use_amp)
+        
         self.current_epoch = 0
         self.best_val_loss = float('inf')
-        self.train_history = {
-            'train_loss': [], 'val_loss': [],
-            'train_metrics': [], 'val_metrics': []
-        }
-        self.clip_grad_norm = float(getattr(self.config.training, 'clip_grad_norm', 1.0))
+        self.train_history = {'train_loss':[], 'val_loss': [], 'train_metrics': [], 'val_metrics':[]}
+
+        # Setup optimization components
+        self.optimizer = self._setup_optimizer()
+        base_scheduler = self._setup_scheduler()
+        
+        self.callbacks = CallbackHandler()
+        self._setup_callbacks(base_scheduler)
+        
+        # Initialize TensorBoard Writer
+        self.writer = None
+        logging_cfg = getattr(self.config, 'logging', {})
+        if isinstance(logging_cfg, dict) and logging_cfg.get('tensorboard', False):
+            tb_dir = Path(self.config.experiment.get('save_dir', './output')) / 'tensorboard'
+            tb_dir.mkdir(parents=True, exist_ok=True)
+            self.writer = SummaryWriter(log_dir=str(tb_dir))
 
     def _setup_optimizer(self) -> optim.Optimizer:
         opt_cfg = self.config.training
-        optimizer_name = getattr(opt_cfg, 'optimizer', 'adam').lower()
-        
-        learning_rate = float(getattr(opt_cfg, 'learning_rate', 0.001))
-        weight_decay = float(getattr(opt_cfg, 'weight_decay', 0.0))
+        opt_name = getattr(opt_cfg, 'optimizer', 'adamw').lower()
+        lr = float(getattr(opt_cfg, 'learning_rate', 0.001))
+        wd = float(getattr(opt_cfg, 'weight_decay', 0.001))
 
-        if optimizer_name == 'adam':
-            return optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-        elif optimizer_name == 'adamw':
-            return optim.AdamW(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-        elif optimizer_name == 'sgd':
-            return optim.SGD(self.model.parameters(), lr=learning_rate, momentum=0.9, weight_decay=weight_decay)
-        elif optimizer_name == 'rmsprop':
-            return optim.RMSprop(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-        elif optimizer_name == 'adadelta':
-            return optim.Adadelta(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-        else:
-            raise ValueError(f"Unknown optimizer: {optimizer_name}")
+        if opt_name == 'adam': 
+            return optim.Adam(self.model.parameters(), lr=lr, weight_decay=wd)
+        elif opt_name == 'sgd': 
+            return optim.SGD(self.model.parameters(), lr=lr, momentum=0.9, weight_decay=wd)
+        elif opt_name == 'adadelta': 
+            return optim.Adadelta(self.model.parameters(), lr=lr, weight_decay=wd)
+        else: 
+            return optim.AdamW(self.model.parameters(), lr=lr, weight_decay=wd)
 
-    def _setup_scheduler(self) -> Optional[optim.lr_scheduler._LRScheduler]:
-        scheduler_config = getattr(self.config.training, 'scheduler', {})
-        if not scheduler_config or scheduler_config.get('type') is None:
+    def _setup_scheduler(self) -> Optional[torch.optim.lr_scheduler._LRScheduler]:
+        sched_cfg = getattr(self.config.training, 'scheduler', {})
+        if not sched_cfg or not sched_cfg.get('type'): 
             return None
-        
-        scheduler_type = scheduler_config['type'].lower()
-        
-        if scheduler_type == 'reduce_on_plateau':
+        s_type = sched_cfg['type'].lower()
+        if s_type == 'reduce_on_plateau':
             return optim.lr_scheduler.ReduceLROnPlateau(
-                self.optimizer, mode='min',
-                factor=float(scheduler_config.get('factor', 0.5)),
-                patience=int(scheduler_config.get('patience', 10)),
-                min_lr=float(scheduler_config.get('min_lr', 1e-6))
+                self.optimizer, mode='min', factor=float(sched_cfg.get('factor', 0.5)),
+                patience=int(sched_cfg.get('patience', 10)), min_lr=float(sched_cfg.get('min_lr', 1e-6))
             )
-        elif scheduler_type == 'cosine':
-            return optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=int(self.config.training.epochs),
-                eta_min=float(scheduler_config.get('min_lr', 1e-6))
-            )
-        elif scheduler_type == 'step':
-            return optim.lr_scheduler.StepLR(
-                self.optimizer, step_size=int(scheduler_config.get('step_size', 30)),
-                gamma=float(scheduler_config.get('gamma', 0.1))
-            )
-        else:
-            raise ValueError(f"Unknown scheduler type: {scheduler_type}")
+        return None
 
-    def _setup_callbacks(self) -> Dict[str, Any]:
-        callbacks = {}
-        early_stop_config = getattr(self.config.training, 'early_stopping', {})
-        if early_stop_config.get('enabled', False):
-            callbacks['early_stopping'] = EarlyStopping(
-                patience=int(early_stop_config.get('patience', 30)),
-                min_delta=float(early_stop_config.get('min_delta', 1e-4))
-            )
-        checkpoint_config = getattr(self.config.training, 'checkpoint', {})
-        if checkpoint_config.get('enabled', True):
-            save_dir = Path(self.config.experiment.get('save_dir', './output')) / 'checkpoints'
-            callbacks['checkpoint'] = ModelCheckpoint(
-                save_dir=save_dir,
-                save_best_only=checkpoint_config.get('save_best_only', True),
-                save_frequency=int(checkpoint_config.get('save_frequency', 10))
-            )
-        return callbacks
-
-    def _compute_loss(self, predictions: Dict[str, torch.Tensor],
-                      targets: Dict[str, torch.Tensor]) -> torch.Tensor:
-        total_loss = 0.0
-        valid_tasks = 0
-        for task_name in self.task_names:
-            if task_name in predictions and task_name in targets:
-                weight = self.task_weights.get(task_name, 1.0)
-                if weight > 0.0:
-                    loss = masked_mse(predictions[task_name], targets[task_name])
-                    if not torch.isnan(loss):
-                        total_loss += weight * loss
-                        valid_tasks += 1
-                    
-        if valid_tasks == 0:
-            return torch.tensor(0.0, device=self.device, requires_grad=True)
+    def _setup_callbacks(self, base_scheduler):
+        early_stop_cfg = getattr(self.config.training, 'early_stopping', {})
+        if early_stop_cfg.get('enabled', True):
+            self.callbacks.add_callback(EarlyStopping(
+                patience=int(early_stop_cfg.get('patience', 15)),
+                min_delta=float(early_stop_cfg.get('min_delta', 1e-4)), 
+                restore_best_weights=True, verbose=False
+            ))
             
-        return total_loss
+        checkpoint_cfg = getattr(self.config.training, 'checkpoint', {})
+        if checkpoint_cfg.get('enabled', True):
+            save_dir = Path(self.config.experiment.get('save_dir', './output')) / 'checkpoints'
+            self.callbacks.add_callback(ModelCheckpoint(save_dir=str(save_dir), save_best_only=True, verbose=False))
+            
+        if base_scheduler is not None:
+            self.callbacks.add_callback(LearningRateScheduler(base_scheduler, verbose=False))
+
+    def _unpack_batch(self, batch_data: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Dict, Optional[np.ndarray]]:
+        if not isinstance(batch_data, dict):
+            raise ValueError("Dataset must return a dictionary format mapping inputs and targets.")
+
+        targets_dict = {}
+        dyn_x = batch_data.get('features', batch_data.get('dyn'))
+        stat_num = batch_data.get('static_num', batch_data.get('s_num'))
+        stat_cat = batch_data.get('categorical_features', batch_data.get('s_cat'))
+        b_idx_raw = batch_data.get('basin_idx')
+        
+        basin_idx = b_idx_raw.cpu().numpy() if isinstance(b_idx_raw, torch.Tensor) else np.array(b_idx_raw)
+        
+        for k, v in batch_data.items():
+            k_lower = str(k).lower()
+            if k_lower in self.task_names:
+                targets_dict[k_lower] = v
+                
+        if basin_idx is None and stat_num is not None:
+            basin_idx = np.zeros(dyn_x.shape[0])
+            
+        return dyn_x, stat_num, stat_cat, targets_dict, basin_idx
+
+    def _to_tensor(self, v: Any) -> Optional[torch.Tensor]:
+        if v is None: 
+            return None
+        if isinstance(v, torch.Tensor): 
+            return v.to(self.device).float()
+        if isinstance(v, np.ndarray): 
+            return torch.from_numpy(v).to(self.device).float()
+        return torch.tensor(v, device=self.device, dtype=torch.float32)
+
+    def train_epoch(self, loader: DataLoader, pbar: Optional[tqdm] = None) -> Tuple[float, Dict[str, float], Dict[str, float]]:
+        self.model.train()
+        total_loss = 0.0
+        task_loss_sums = {t: 0.0 for t in self.task_names}
+        valid_batches = 0
+        current_lr = self.optimizer.param_groups[0]['lr']
+        
+        all_preds, all_targets, all_basin_idxs, all_stat_nums = {t: [] for t in self.task_names}, {t:[] for t in self.task_names}, [],[]
+
+        for batch_data in loader:
+            try:
+                dyn_x, stat_num, stat_cat, targets_dict, basin_idx = self._unpack_batch(batch_data)
+                
+                if dyn_x is None or not targets_dict:
+                    continue
+
+                dyn_x = torch.nan_to_num(self._to_tensor(dyn_x), nan=0.0)
+                stat_num_tensor = torch.nan_to_num(self._to_tensor(stat_num), nan=0.0)
+                if stat_cat is not None: 
+                    stat_cat = stat_cat.to(self.device, dtype=torch.long)
+                targets_dev = {k: self._to_tensor(v) for k, v in targets_dict.items() if k in self.task_names}
+
+                self.optimizer.zero_grad()
+                
+                # Forward pass with AMP
+                with autocast(enabled=self.use_amp):
+                    preds_raw, _ = self.model(dyn_x, stat_num_tensor, stat_cat)
+                    
+                    preds_dict = {}
+                    for k, v in preds_raw.items():
+                        k_lower = str(k).lower()
+                        if isinstance(v, dict):
+                            preds_dict[k_lower] = {
+                                'means': torch.clamp(torch.nan_to_num(v['means']), -10.0, 10.0), 
+                                'weights': torch.clamp(torch.nan_to_num(v['weights']), 0.0, 1.0)
+                            }
+                        else:
+                            preds_dict[k_lower] = torch.clamp(torch.nan_to_num(v), -10.0, 10.0)
+
+                    # Loss computation
+                    if self.criterion is not None:
+                        if hasattr(self.criterion, 'stat') and stat_num_tensor is not None:
+                            loss = self.criterion(preds_dict, targets_dev, stat_num_tensor)
+                        else:
+                            loss = self.criterion(preds_dict, targets_dev)
+                    else:
+                        valid_tasks =[t for t in self.task_names if t in preds_dict and t in targets_dev]
+                        if valid_tasks:
+                            loss = sum([self.task_weights.get(t, 1.0) * masked_rmse(preds_dict[t], targets_dev[t]) for t in valid_tasks])
+                        else:
+                            continue
+                    
+                    loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=0.0)
+                    if not loss.requires_grad:
+                        loss.requires_grad = True
+
+                # Backward pass with AMP scaler
+                self.amp_scaler.scale(loss).backward()
+                
+                # Unscale before gradient clipping
+                self.amp_scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
+                
+                # Optimizer step and scaler update
+                self.amp_scaler.step(self.optimizer)
+                self.amp_scaler.update()
+                
+                loss_val = float(loss.item())
+                total_loss += loss_val
+                valid_batches += 1
+
+                # Metric extraction
+                with torch.no_grad():
+                    for t in self.task_names:
+                        if t in preds_dict and t in targets_dev:
+                            task_loss_sums[t] += float(torch.nan_to_num(masked_rmse(preds_dict[t], targets_dev[t])).item())
+                            
+                            p_val = preds_dict[t]
+                            if isinstance(p_val, dict) and 'means' in p_val:
+                                p_val = torch.sum(p_val['means'].squeeze(-1) * p_val['weights'], dim=1)
+                            else:
+                                p_val = p_val.squeeze(-1)
+                                
+                            all_preds[t].append(p_val.detach().cpu().numpy().flatten())
+                            all_targets[t].append(targets_dev[t].detach().cpu().numpy().flatten())
+                    
+                    if basin_idx is not None: 
+                        all_basin_idxs.append(basin_idx.flatten())
+                    if stat_num_tensor is not None: 
+                        all_stat_nums.append(stat_num_tensor.detach().cpu().numpy())
+                
+                if pbar is not None:
+                    disp_loss = total_loss / valid_batches
+                    pbar.set_postfix({'loss': f"{disp_loss:.4f}"})
+
+            finally:
+                if pbar is not None:
+                    pbar.update(1)
+
+        preds_concat = {t: (np.concatenate(all_preds[t]) if all_preds[t] else np.array([])) for t in self.task_names}
+        targets_concat = {t: (np.concatenate(all_targets[t]) if all_targets[t] else np.array([])) for t in self.task_names}
+        basin_idxs_concat = np.concatenate(all_basin_idxs) if len(all_basin_idxs) > 0 else np.array([])
+        stat_nums_concat = np.concatenate(all_stat_nums, axis=0) if all_stat_nums else None
+
+        p_phys, t_phys = self._apply_inverse_scaling(preds_concat, targets_concat, basin_idxs_concat, stat_nums_concat)
+        train_metrics, _ = self._compute_spatial_median_metrics(p_phys, t_phys, basin_idxs_concat)
+
+        valid_batches = max(1, valid_batches) 
+        return total_loss / valid_batches, {t: v / valid_batches for t, v in task_loss_sums.items()}, train_metrics
+
+    @torch.no_grad()
+    def evaluate(self, loader: DataLoader, pbar: Optional[tqdm] = None, desc: str = "Evaluating") -> Tuple:
+        """
+        Executes validation or test loop.
+        Returns:
+            (avg_loss, avg_tasks, final_metrics, p_phys, t_phys, basin_idxs, gates_concat, per_basin_metrics)
+        """
+        self.model.eval()
+        total_loss = 0.0
+        task_loss_sums = {t: 0.0 for t in self.task_names}
+        valid_batches = 0
+        
+        all_preds, all_targets, all_basin_idxs, all_stat_nums = {t:[] for t in self.task_names}, {t: [] for t in self.task_names}, [],[]
+        all_gates = {}
+
+        internal_pbar = False
+        if pbar is None:
+            pbar = tqdm(total=len(loader), desc=desc, leave=True, file=sys.stdout, ncols=100)
+            internal_pbar = True
+
+        for batch_data in loader:
+            try:
+                dyn_x, stat_num, stat_cat, targets_dict, basin_idx = self._unpack_batch(batch_data)
+
+                dyn_x = torch.nan_to_num(self._to_tensor(dyn_x), nan=0.0)
+                stat_num_tensor = torch.nan_to_num(self._to_tensor(stat_num), nan=0.0)
+                if stat_cat is not None: 
+                    stat_cat = stat_cat.to(self.device, dtype=torch.long)
+                targets_dev = {k: self._to_tensor(v) for k, v in targets_dict.items() if k in self.task_names}
+
+                # Forward pass: extract BOTH predictions and gate_weights
+                with autocast(enabled=self.use_amp):
+                    preds_raw, gates_raw = self.model(dyn_x, stat_num_tensor, stat_cat)
+                
+                # Store gating weights for interpretability (CGC analysis)
+                for k, v in gates_raw.items():
+                    if k not in all_gates: 
+                        all_gates[k] = []
+                    all_gates[k].append(v.cpu().numpy())
+
+                preds_dict = {}
+                for k, v in preds_raw.items():
+                    k_lower = str(k).lower()
+                    if isinstance(v, dict):
+                        preds_dict[k_lower] = {
+                            'means': torch.clamp(torch.nan_to_num(v['means']), -10.0, 10.0), 
+                            'weights': torch.clamp(torch.nan_to_num(v['weights']), 0.0, 1.0)
+                        }
+                    else:
+                        preds_dict[k_lower] = torch.clamp(torch.nan_to_num(v), -10.0, 10.0)
+                
+                if self.criterion is not None:
+                    if hasattr(self.criterion, 'stat') and stat_num_tensor is not None:
+                        loss = self.criterion(preds_dict, targets_dev, stat_num_tensor)
+                    else:
+                        loss = self.criterion(preds_dict, targets_dev)
+                else:
+                    valid_tasks =[t for t in self.task_names if t in preds_dict and t in targets_dev]
+                    if valid_tasks:
+                        loss = sum([self.task_weights.get(t, 1.0) * masked_rmse(preds_dict[t], targets_dev[t]) for t in valid_tasks])
+                    else:
+                        loss = torch.tensor(0.0, device=self.device)
+                    
+                loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=0.0)
+                total_loss += float(loss.item())
+                valid_batches += 1
+
+                for t in self.task_names:
+                    if t in preds_dict and t in targets_dev:
+                        task_loss_sums[t] += float(torch.nan_to_num(masked_rmse(preds_dict[t], targets_dev[t])).item())
+                        
+                        p_val = preds_dict[t]
+                        if isinstance(p_val, dict) and 'means' in p_val:
+                            p_val = torch.sum(p_val['means'].squeeze(-1) * p_val['weights'], dim=1)
+                        else:
+                            p_val = p_val.squeeze(-1)
+                        
+                        all_preds[t].append(p_val.detach().cpu().numpy().flatten())
+                        all_targets[t].append(targets_dev[t].detach().cpu().numpy().flatten())
+                
+                if basin_idx is not None: 
+                    all_basin_idxs.append(basin_idx.flatten())
+                if stat_num_tensor is not None: 
+                    all_stat_nums.append(stat_num_tensor.detach().cpu().numpy())
+                    
+                if not internal_pbar and pbar is not None:
+                    disp_loss = total_loss / valid_batches
+                    pbar.set_postfix({'loss': f"{disp_loss:.4f}"})
+
+            finally:
+                if pbar is not None:
+                    pbar.update(1)
+
+        if internal_pbar and pbar is not None: 
+            pbar.close()
+
+        preds_concat = {t: (np.concatenate(all_preds[t]) if all_preds[t] else np.array([])) for t in self.task_names}
+        targets_concat = {t: (np.concatenate(all_targets[t]) if all_targets[t] else np.array([])) for t in self.task_names}
+        basin_idxs_concat = np.concatenate(all_basin_idxs) if len(all_basin_idxs) > 0 else np.array([])
+        stat_nums_concat = np.concatenate(all_stat_nums, axis=0) if all_stat_nums else None
+        
+        gates_concat = {k: np.concatenate(v, axis=0) for k, v in all_gates.items()} if all_gates else {}
+
+        p_phys, t_phys = self._apply_inverse_scaling(preds_concat, targets_concat, basin_idxs_concat, stat_nums_concat)
+        final_metrics, per_basin_metrics = self._compute_spatial_median_metrics(p_phys, t_phys, basin_idxs_concat)
+
+        valid_batches = max(1, valid_batches) 
+        return (total_loss / valid_batches, {t: v / valid_batches for t, v in task_loss_sums.items()}, 
+                final_metrics, p_phys, t_phys, basin_idxs_concat, gates_concat, per_basin_metrics)
 
     def _safe_inverse_transform(self, scaler, data: np.ndarray, task_name: str, basin_idx: int) -> np.ndarray:
-        if scaler is None:
+        if scaler is None: 
             return data
-        if np.abs(scaler.scale_) < 1e-6:
+        if hasattr(scaler, 'scale_') and np.abs(scaler.scale_) < 1e-6: 
             return data
         try:
             transformed = scaler.inverse_transform(data)
-        except Exception as e:
-            logger.warning(f"Basin {basin_idx}, task {task_name}: inverse_transform failed: {e}")
+        except Exception:
             return data
-            
         if np.isnan(transformed).any() or np.isinf(transformed).any():
             return data
         return transformed
 
-    def train_epoch(self, train_loader: DataLoader, epoch: int) -> Tuple[float, Dict[str, float]]:
-        self.model.train()
-        total_loss = 0.0
-        
-        task_losses = {task_name: 0.0 for task_name in self.task_names}
-        task_batches = {task_name: 0 for task_name in self.task_names}
-        
-        all_predictions = {}
-        all_targets = {}
-        all_basin_idxs = []
-
-        epochs = int(self.config.training.epochs)
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", file=sys.stdout)
-        
-        for batch_idx, batch in enumerate(pbar):
-            features = batch['features'].to(self.device)
-            cat_x = batch.get('categorical_features')
-            if cat_x is not None:
-                cat_x = cat_x.to(self.device)
+    def _apply_inverse_scaling(self, preds_concat, targets_concat, basin_idxs_concat, stat_nums_concat=None):
+        if getattr(self, 'basin_scalers', None) is not None:
+            p_phys = {t: np.zeros_like(preds_concat[t]) for t in self.task_names}
+            t_phys = {t: np.zeros_like(targets_concat[t]) for t in self.task_names}
+            for basin_idx, task_scalers in enumerate(self.basin_scalers):
+                if task_scalers is None: 
+                    continue
+                mask = (basin_idxs_concat == basin_idx)
+                if mask.sum() == 0: 
+                    continue
                 
-            basin_idxs = batch['basin_idx'].cpu().numpy()
-            targets = {name: batch[name].to(self.device) for name in self.task_names if name in batch}
+                for t in self.task_names:
+                    scaler = task_scalers.get(t)
+                    if scaler is None:
+                        p_phys[t][mask] = preds_concat[t][mask]
+                        t_phys[t][mask] = targets_concat[t][mask]
+                        continue
+                    
+                    try:
+                        p_transformed = scaler.inverse_transform(preds_concat[t][mask])
+                        t_transformed = scaler.inverse_transform(targets_concat[t][mask])
+                        p_phys[t][mask] = p_transformed if not np.isnan(p_transformed).any() else preds_concat[t][mask]
+                        t_phys[t][mask] = t_transformed if not np.isnan(t_transformed).any() else targets_concat[t][mask]
+                    except Exception:
+                        p_phys[t][mask] = preds_concat[t][mask]
+                        t_phys[t][mask] = targets_concat[t][mask]
+            return p_phys, t_phys
+        
+        elif self.scaler is not None:
+            if stat_nums_concat is not None and preds_concat.get(self.task_names[0],[]).size > 0:
+                return self.scaler.inverse_transform_target(preds_concat, stat_nums_concat), self.scaler.inverse_transform_target(targets_concat, stat_nums_concat)
+        
+        return preds_concat, targets_concat
 
-            self.optimizer.zero_grad()
-            predictions = self.model(features, categorical_features=cat_x)
-            
-            if torch.isnan(features).any():
-                logger.error("\n[Fatal] Features contain NaN! Check data imputation.")
-                sys.exit(1)
-            if cat_x is not None and torch.isnan(cat_x).any():
-                logger.error("\n[Fatal] Categorical features contain NaN!")
-                sys.exit(1)
-            if any(torch.isnan(p).any() for p in predictions.values()):
-                logger.error("\n[Fatal] Model predicted NaN! Possible exploding gradients.")
-                sys.exit(1)
-            
-            loss = self._compute_loss(predictions, targets)
-            
-            if loss.item() == 0.0 or torch.isnan(loss):
-                pbar.set_postfix({'avg_loss': f"{(total_loss / max(1, batch_idx)):.4f}"})
+    def _compute_spatial_median_metrics(self, p_phys: Dict, t_phys: Dict, basin_idxs: np.ndarray) -> Tuple[Dict[str, float], Dict[int, Dict[str, float]]]:
+        unique_basins = np.unique(basin_idxs) if len(basin_idxs) > 0 else np.array([])
+        raw_metrics = getattr(self.config.evaluation, 'metrics', ['nse', 'kge', 'rmse', 'bias', 'corr'])
+        target_metrics = [m.lower() for m in raw_metrics]
+        
+        final_metrics = {}
+        per_basin_metrics = {}
+        global_nse_list =[]
+
+        for task in self.task_names:
+            if task not in p_phys or task not in t_phys or p_phys[task].size == 0: 
                 continue
-                
-            loss.backward()
             
-            if self.clip_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
+            basin_metrics_list = {m:[] for m in target_metrics}
+            for b_idx in unique_basins:
+                mask = (basin_idxs == b_idx)
+                if mask.sum() < 1: 
+                    continue
                 
-            self.optimizer.step()
-            total_loss += loss.item()
-
-            with torch.no_grad():
-                for task_name in self.task_names:
-                    weight = self.task_weights.get(task_name, 1.0)
-                    if weight > 0.0 and task_name in predictions and task_name in targets:
-                        t_loss = masked_mse(predictions[task_name], targets[task_name])
-                        if not torch.isnan(t_loss):
-                            task_losses[task_name] += t_loss.item()
-                            task_batches[task_name] += 1
-                            
-                        pred = predictions[task_name].detach().cpu()
-                        targ = targets[task_name].detach().cpu()
+                p_b = p_phys[task][mask].flatten()
+                t_b = t_phys[task][mask].flatten()
+                
+                valid_idx = ~np.isnan(t_b) & ~np.isnan(p_b)
+                if valid_idx.sum() < 1: 
+                    continue
+                
+                res = compute_metrics({task: torch.from_numpy(p_b[valid_idx])}, {task: torch.from_numpy(t_b[valid_idx])}, target_metrics)
+                
+                b_idx_int = int(b_idx)
+                if b_idx_int not in per_basin_metrics:
+                    per_basin_metrics[b_idx_int] = {}
+                    
+                for m in target_metrics:
+                    val = res.get(f"{task}_{m}")
+                    if val is not None and not np.isnan(val):
+                        basin_metrics_list[m].append(val)
+                        per_basin_metrics[b_idx_int][f"{task}_{m}"] = val
+                        if m == 'nse': 
+                            global_nse_list.append(val)
                         
-                        if pred.dim() == 1:
-                            pred = pred.unsqueeze(1)
-                        elif pred.dim() == 3:
-                            pred = pred.view(-1, pred.size(-1))
-                            
-                        if targ.dim() == 1:
-                            targ = targ.unsqueeze(1)
-                        elif targ.dim() == 3:
-                            targ = targ.view(-1, targ.size(-1))
-                            
-                        all_predictions.setdefault(task_name, []).append(pred)
-                        all_targets.setdefault(task_name, []).append(targ)
-                
-                all_basin_idxs.append(basin_idxs)
-
-            pbar.set_postfix({'avg_loss': f"{(total_loss / (batch_idx + 1)):.4f}"})
-            
-            if self.use_wandb and batch_idx % 10 == 0:
-                wandb.log({
-                    'train/batch_loss': loss.item(), 
-                    'train/learning_rate': self.optimizer.param_groups[0]['lr']
-                })
-
-        avg_loss = total_loss / len(train_loader) if len(train_loader) > 0 else float('nan')
-        
-        if not all_predictions:
-            return avg_loss, {f'{t}_loss': float('nan') for t in self.task_names}
-
-        for task_name in all_predictions:
-            all_predictions[task_name] = torch.cat(all_predictions[task_name], dim=0)
-            all_targets[task_name] = torch.cat(all_targets[task_name], dim=0)
-            
-        all_basin_idxs = np.concatenate(all_basin_idxs)
-
-        if self.basin_scalers is not None:
-            pred_orig = {}
-            target_orig = {}
-            for task_name in all_predictions:
-                pred_orig[task_name] = torch.zeros_like(all_predictions[task_name])
-                target_orig[task_name] = torch.zeros_like(all_targets[task_name])
-
-            for basin_idx, task_scalers in enumerate(self.basin_scalers):
-                if task_scalers is None:
-                    continue
-                mask = (all_basin_idxs == basin_idx)
-                if mask.sum() == 0:
-                    continue
-                
-                for task_name in all_predictions:
-                    scaler = task_scalers.get(task_name)
-                    if scaler is None:
-                        pred_orig[task_name][mask] = all_predictions[task_name][mask]
-                        target_orig[task_name][mask] = all_targets[task_name][mask]
-                        continue
+            for m in target_metrics:
+                if basin_metrics_list[m]:
+                    arr = np.array(basin_metrics_list[m])
+                    final_metrics[f"{task}_{m}"] = float(np.median(arr))
+                    final_metrics[f"{task}_{m}_75th"] = float(np.percentile(arr, 75))
+                    final_metrics[f"{task}_{m}_pos_ratio"] = float(np.mean(arr > 0) * 100.0)
+                else:
+                    final_metrics[f"{task}_{m}"] = float('nan')
+                    final_metrics[f"{task}_{m}_75th"] = float('nan')
+                    final_metrics[f"{task}_{m}_pos_ratio"] = float('nan')
                     
-                    pred_np = all_predictions[task_name][mask].numpy()
-                    target_np = all_targets[task_name][mask].numpy()
-                    
-                    pred_inv = self._safe_inverse_transform(scaler, pred_np, task_name, basin_idx)
-                    target_inv = self._safe_inverse_transform(scaler, target_np, task_name, basin_idx)
-                    
-                    pred_orig[task_name][mask] = torch.from_numpy(pred_inv)
-                    target_orig[task_name][mask] = torch.from_numpy(target_inv)
-
-            all_predictions = pred_orig
-            all_targets = target_orig
-
-        train_metrics = compute_metrics(all_predictions, all_targets, self.config.evaluation['metrics'])
-        
-        for task_name in self.task_names:
-            if task_batches[task_name] > 0:
-                train_metrics[f'{task_name}_loss'] = task_losses[task_name] / task_batches[task_name]
-            else:
-                train_metrics[f'{task_name}_loss'] = float('nan')
-
-        return avg_loss, train_metrics
-
-    def validate(self, val_loader: DataLoader) -> Tuple[float, Dict[str, float]]:
-        self.model.eval()
-        total_loss = 0.0
-        
-        task_losses = {task_name: 0.0 for task_name in self.task_names}
-        task_batches = {task_name: 0 for task_name in self.task_names}
-        
-        all_predictions = {}
-        all_targets = {}
-        all_basin_idxs = []
-
-        with torch.no_grad():
-            for batch in val_loader:
-                features = batch['features'].to(self.device)
-                cat_x = batch.get('categorical_features')
-                if cat_x is not None:
-                    cat_x = cat_x.to(self.device)
-                    
-                basin_idxs = batch['basin_idx'].cpu().numpy()
-                targets = {name: batch[name].to(self.device) for name in self.task_names if name in batch}
-
-                predictions = self.model(features, categorical_features=cat_x)
-                loss = self._compute_loss(predictions, targets)
-                
-                if not torch.isnan(loss):
-                    total_loss += loss.item()
-
-                for task_name in self.task_names:
-                    weight = self.task_weights.get(task_name, 1.0)
-                    if weight > 0.0 and task_name in predictions and task_name in targets:
-                        t_loss = masked_mse(predictions[task_name], targets[task_name])
-                        if not torch.isnan(t_loss):
-                            task_losses[task_name] += t_loss.item()
-                            task_batches[task_name] += 1
-                            
-                        pred = predictions[task_name].cpu()
-                        targ = targets[task_name].cpu()
-                        
-                        if pred.dim() == 1:
-                            pred = pred.unsqueeze(1)
-                        elif pred.dim() == 3:
-                            pred = pred.view(-1, pred.size(-1))
-                            
-                        if targ.dim() == 1:
-                            targ = targ.unsqueeze(1)
-                        elif targ.dim() == 3:
-                            targ = targ.view(-1, targ.size(-1))
-                            
-                        all_predictions.setdefault(task_name, []).append(pred)
-                        all_targets.setdefault(task_name, []).append(targ)
-
-                all_basin_idxs.append(basin_idxs)
-
-        if not all_predictions:
-            return float('nan'), {f'{t}_nse': float('nan') for t in self.task_names}
-
-        for task_name in all_predictions:
-            all_predictions[task_name] = torch.cat(all_predictions[task_name], dim=0)
-            all_targets[task_name] = torch.cat(all_targets[task_name], dim=0)
-            
-        all_basin_idxs = np.concatenate(all_basin_idxs)
-
-        if self.basin_scalers is not None:
-            pred_orig = {}
-            target_orig = {}
-            for task_name in all_predictions:
-                pred_orig[task_name] = torch.zeros_like(all_predictions[task_name])
-                target_orig[task_name] = torch.zeros_like(all_targets[task_name])
-
-            for basin_idx, task_scalers in enumerate(self.basin_scalers):
-                if task_scalers is None:
-                    continue
-                    
-                mask = (all_basin_idxs == basin_idx)
-                if mask.sum() == 0:
-                    continue
-                    
-                for task_name in all_predictions:
-                    scaler = task_scalers.get(task_name)
-                    if scaler is None:
-                        pred_orig[task_name][mask] = all_predictions[task_name][mask]
-                        target_orig[task_name][mask] = all_targets[task_name][mask]
-                        continue
-
-                    pred_np = all_predictions[task_name][mask].numpy()
-                    target_np = all_targets[task_name][mask].numpy()
-
-                    pred_inv = self._safe_inverse_transform(scaler, pred_np, task_name, basin_idx)
-                    target_inv = self._safe_inverse_transform(scaler, target_np, task_name, basin_idx)
-
-                    pred_orig[task_name][mask] = torch.from_numpy(pred_inv)
-                    target_orig[task_name][mask] = torch.from_numpy(target_inv)
-
-            all_predictions = pred_orig
-            all_targets = target_orig
-
-        global_metrics = compute_metrics(all_predictions, all_targets, self.config.evaluation['metrics'])
-        
-        for task_name in self.task_names:
-            if task_batches[task_name] > 0:
-                global_metrics[f'{task_name}_loss'] = task_losses[task_name] / task_batches[task_name]
-            else:
-                global_metrics[f'{task_name}_loss'] = float('nan')
-
-        avg_loss = total_loss / len(val_loader) if len(val_loader) > 0 else float('nan')
-        return avg_loss, global_metrics
+        return final_metrics, per_basin_metrics
 
     def fit(self, train_loader: DataLoader, val_loader: DataLoader) -> Dict[str, Any]:
-        from torch.utils.tensorboard import SummaryWriter
-        log_dir = Path(self.config.experiment.get('save_dir', './output')) / 'tensorboard'
-        log_dir.mkdir(parents=True, exist_ok=True)
-        writer = SummaryWriter(log_dir=str(log_dir))
+        save_path = Path(self.config.experiment.get('save_dir', './output'))
+        save_path.mkdir(parents=True, exist_ok=True)
 
-        start_time = time.time()
-
-        if self.use_wandb:
-            wandb.init(project="HydroMTL_CGC", config=self.config)
-            wandb.watch(self.model)
-
-        epochs = int(self.config.training.epochs)
-        for epoch in range(self.current_epoch, epochs):
-            self.current_epoch = epoch
-            
-            train_loss, train_metrics = self.train_epoch(train_loader, epoch)
-            val_loss, val_metrics = self.validate(val_loader)
-
-            if self.lr_scheduler is not None:
-                if isinstance(self.lr_scheduler, optim.lr_scheduler.ReduceLROnPlateau):
-                    self.lr_scheduler.step(val_loss)
-                else:
-                    self.lr_scheduler.step()
-
-            self.train_history['train_loss'].append(train_loss)
-            self.train_history['val_loss'].append(val_loss)
-            self.train_history['train_metrics'].append(train_metrics)
-            self.train_history['val_metrics'].append(val_metrics)
-
-            current_lr = self.optimizer.param_groups[0]['lr']
-            
-            print(f"\n" + "=" * 95)
-            print(f"Epoch {epoch+1}/{epochs} Summary | Total Train Loss: {train_loss:.4f} | Total Val Loss: {val_loss:.4f} | LR: {current_lr:.6e}")
-            print("=" * 95)
-            
-            metrics_to_print = ['loss', 'nse', 'kge', 'rmse', 'bias', 'corr']
-            active_tasks = [t for t in self.task_names if self.task_weights.get(t, 1.0) > 0.0]
-            
-            for i, task_name in enumerate(active_tasks):
-                print(f"[{task_name.upper()}]")
+        epochs = int(getattr(self.config.training, 'epochs', 100))
+        total_batches = len(train_loader) + len(val_loader)
+        
+        try:
+            for epoch in range(self.current_epoch + 1, epochs + 1):
+                self.current_epoch = epoch
+                pbar = tqdm(total=total_batches, desc=f"Epoch {epoch}/{epochs} [Train]", leave=True, file=sys.stdout, ncols=100)
                 
-                train_str = []
-                for m in metrics_to_print:
-                    val_val = train_metrics.get(f'{task_name}_{m}', float('nan'))
-                    train_str.append(f"{m.upper()}: {val_val:>8.4f}" if not np.isnan(val_val) else f"{m.upper()}:      NaN")
-                print("  Train -> " + " | ".join(train_str))
+                t_loss, t_tasks, t_metrics = self.train_epoch(train_loader, pbar)
                 
-                val_str = []
-                for m in metrics_to_print:
-                    val_val = val_metrics.get(f'{task_name}_{m}', float('nan'))
-                    val_str.append(f"{m.upper()}: {val_val:>8.4f}" if not np.isnan(val_val) else f"{m.upper()}:      NaN")
-                print("  Val   -> " + " | ".join(val_str))
+                pbar.set_description(f"Epoch {epoch}/{epochs}[Valid]")
+                v_loss, v_tasks, v_metrics, _, _, _, _, _ = self.evaluate(val_loader, pbar)
+                pbar.close()
+
+                for cb in self.callbacks.callbacks:
+                    if isinstance(cb, LearningRateScheduler): 
+                        cb.step(v_loss)
+                    elif isinstance(cb, EarlyStopping): 
+                        cb.step(v_loss, self.model)
+                    elif isinstance(cb, ModelCheckpoint): 
+                        cb.step(self.model, epoch, v_loss, (v_loss < getattr(self, 'best_val_loss', float('inf'))), self.optimizer)
+
+                if not np.isnan(v_loss) and v_loss < self.best_val_loss:
+                    self.best_val_loss = v_loss
+
+                current_lr = self.optimizer.param_groups[0]['lr']
+                self.train_history['train_loss'].append(t_loss)
+                self.train_history['val_loss'].append(v_loss)
+                self.train_history['train_metrics'].append(t_metrics)
+                self.train_history['val_metrics'].append(v_metrics)
+
+                self._print_summary(epoch, epochs, current_lr, t_loss, t_tasks, v_loss, v_tasks, t_metrics, v_metrics)
                 
-                if i < len(active_tasks) - 1:
-                    print("-" * 95)
-            
-            print("=" * 95 + "\n")
-            
-            writer.add_scalar('Loss/train', train_loss, epoch)
-            writer.add_scalar('Loss/val', val_loss, epoch)
-            writer.add_scalar('LearningRate', current_lr, epoch)
-            
-            for task_name in active_tasks:
-                for m in metrics_to_print:
-                    train_val = train_metrics.get(f'{task_name}_{m}', float('nan'))
-                    val_val = val_metrics.get(f'{task_name}_{m}', float('nan'))
+                # TensorBoard Logging
+                if self.writer is not None:
+                    self.writer.add_scalar('Global/Train_Loss', t_loss, epoch)
+                    self.writer.add_scalar('Global/Valid_Loss', v_loss, epoch)
+                    self.writer.add_scalar('Global/Learning_Rate', current_lr, epoch)
                     
-                    if not np.isnan(train_val):
-                        writer.add_scalar(f'{m.upper()}/{task_name}/train', train_val, epoch)
-                    if not np.isnan(val_val):
-                        writer.add_scalar(f'{m.upper()}/{task_name}/val', val_val, epoch)
+                    for t in self.task_names:
+                        if f"{t}_nse" in t_metrics and not np.isnan(t_metrics[f"{t}_nse"]):
+                            self.writer.add_scalar(f'{t.upper()}/Train_NSE', t_metrics[f"{t}_nse"], epoch)
+                        if f"{t}_nse" in v_metrics and not np.isnan(v_metrics[f"{t}_nse"]):
+                            self.writer.add_scalar(f'{t.upper()}/Valid_NSE', v_metrics[f"{t}_nse"], epoch)
+                            
+                        if f"{t}_rmse" in t_metrics and not np.isnan(t_metrics[f"{t}_rmse"]):
+                            self.writer.add_scalar(f'{t.upper()}/Train_RMSE', t_metrics[f"{t}_rmse"], epoch)
+                        if f"{t}_rmse" in v_metrics and not np.isnan(v_metrics[f"{t}_rmse"]):
+                            self.writer.add_scalar(f'{t.upper()}/Valid_RMSE', v_metrics[f"{t}_rmse"], epoch)
 
-            if self.use_wandb:
-                wandb.log({
-                    'epoch': epoch, 
-                    'train/loss': train_loss, 
-                    'val/loss': val_loss,
-                    'train/learning_rate': current_lr,
-                    'train/metrics': train_metrics,
-                    'val/metrics': val_metrics
-                })
-
-            if 'checkpoint' in self.callbacks:
-                self.callbacks['checkpoint'].step(
-                    model=self.model, 
-                    epoch=epoch, 
-                    val_loss=val_loss,
-                    is_best=(val_loss < self.best_val_loss)
-                )
-                
-            if 'early_stopping' in self.callbacks:
-                if self.callbacks['early_stopping'].step(val_loss):
-                    print(f"\n[!] Early stopping triggered at epoch {epoch+1}")
+                early_stopper = next((cb for cb in self.callbacks.callbacks if isinstance(cb, EarlyStopping)), None)
+                if early_stopper and getattr(early_stopper, 'early_stop', False):
+                    print("\n[INFO] Early stopping triggered. Terminating training.")
                     break
-                    
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
 
-        writer.close()
-        training_time = time.time() - start_time
-        print(f"\nTraining completed in {training_time/60:.2f} minutes")
-        print(f"Best validation loss: {self.best_val_loss:.4f}")
-        
-        self.save_checkpoint(is_final=True)
-        
-        if self.use_wandb:
-            wandb.finish()
-            
+        finally:
+            if self.writer is not None:
+                self.writer.close()
+
         return self.train_history
 
-    def save_checkpoint(self, checkpoint_path: Optional[str] = None, is_final: bool = False) -> None:
-        if checkpoint_path is None:
-            save_dir = Path(self.config.experiment.get('save_dir', './output'))
-            save_dir.mkdir(parents=True, exist_ok=True)
-            checkpoint_path = save_dir / ('final_model.pth' if is_final else 'checkpoint.pth')
+    def _print_summary(self, ep: int, total: int, lr: float, t_l: float, t_tk: Dict, v_l: float, v_tk: Dict, t_mets: Dict, v_mets: Dict):
+        print(f"\n{'='*85}")
+        print(f" Epoch {ep}/{total} Summary | LR: {lr:.2e} | Train Loss: {t_l:.4f} | Val Loss: {v_l:.4f}")
+        print(f"{'='*85}")
+        
+        raw_metrics = getattr(self.config.evaluation, 'metrics', ['nse', 'kge', 'rmse', 'bias', 'corr'])
+        metrics_to_print = [m.lower() for m in raw_metrics]
+        
+        for i, t in enumerate(self.task_names):
+            print(f" Task: {t.upper()}")
             
-        checkpoint = {
-            'epoch': self.current_epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.lr_scheduler.state_dict() if self.lr_scheduler else None,
-            'best_val_loss': self.best_val_loss,
-            'train_history': self.train_history,
-            'config': self.config
-        }
-        torch.save(checkpoint, checkpoint_path)
-
-    def load_checkpoint(self, checkpoint_path: str) -> None:
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        if self.lr_scheduler and checkpoint.get('scheduler_state_dict'):
-            self.lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.current_epoch = checkpoint.get('epoch', 0)
-        self.best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-        self.train_history = checkpoint.get('train_history', {})
-
-    def predict(self, data_loader: DataLoader, return_analysis: bool = False) -> Dict[str, np.ndarray]:
-        self.model.eval()
-        predictions = {}
-        with torch.no_grad():
-            for batch in data_loader:
-                features = batch['features'].to(self.device)
-                cat_x = batch.get('categorical_features')
-                if cat_x is not None:
-                    cat_x = cat_x.to(self.device)
-                    
-                model_output = self.model(features, categorical_features=cat_x, return_gate_analysis=return_analysis)
+            t_str = "   ".join([f"{m.upper()}: {t_mets.get(f'{t}_{m}', float('nan')):>6.3f}" for m in metrics_to_print])
+            print(f"   Train  Loss: {t_tk.get(t, 0.0):>6.4f}   {t_str}")
+            
+            v_str = "   ".join([f"{m.upper()}: {v_mets.get(f'{t}_{m}', float('nan')):>6.3f}" for m in metrics_to_print])
+            print(f"   Valid  Loss: {v_tk.get(t, 0.0):>6.4f}   {v_str}")
+            
+            nse_med = v_mets.get(f'{t}_nse', float('nan'))
+            nse_75 = v_mets.get(f'{t}_nse_75th', float('nan'))
+            nse_pos = v_mets.get(f'{t}_nse_pos_ratio', 0.0)
+            print(f"   Stats  Val NSE Median: {nse_med:>6.3f}   (75th: {nse_75:>6.3f})   NSE>0 Ratio: {nse_pos:>5.1f}%")
+            
+            if i < len(self.task_names) - 1: 
+                print("")
                 
-                for task_name, task_pred in model_output.items():
-                    if task_name == 'gate_analysis' and not return_analysis:
-                        continue
-                    predictions.setdefault(task_name, []).append(task_pred.cpu().numpy())
-                    
-        for key in predictions:
-            predictions[key] = np.concatenate(predictions[key], axis=0)
-            
-        return predictions
+        print(f"{'='*85}\n")
