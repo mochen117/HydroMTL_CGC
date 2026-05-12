@@ -1,77 +1,138 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Dict, Optional
-import logging
+# ==============================================================================
+# Copyright (c) 2024-2026. All Rights Reserved.
+# Description: Automated module for executing baseline ablation studies.
+# Dynamically generates STL-Q, STL-ET, and Hard-MTL (Zero Task-Experts) models
+# to benchmark against the HydroMTL_CGC architecture.
+# ==============================================================================
 
-from .mtl_model import FeatureEncoder, TaskTower
+import os
+import yaml
+import subprocess
+from copy import deepcopy
+from pathlib import Path
 
-logger = logging.getLogger(__name__)
+# Dynamically resolve absolute paths based on the new deep directory structure
+# File: mtl_cgc/core/baseline/baselines.py
+# Root: Parent x 3 -> core -> mtl_cgc -> HydroMTL_CGC
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
 
-class Hard_MTL_Model(nn.Module):
-    def __init__(self, config: Dict):
-        super().__init__()
-        self.config = config
+MAIN_SCRIPT = PROJECT_ROOT / "main.py"
+BASE_CONFIG_PATH = PROJECT_ROOT / "mtl_cgc" / "configs" / "default.yaml"
+
+
+def load_base_config(path: Path) -> dict:
+    """Loads the base YAML configuration."""
+    with open(path, 'r') as f:
+        return yaml.safe_load(f)
+
+
+def save_temp_config(config_dict: dict, path: Path):
+    """Saves the mutated configuration to a temporary YAML file."""
+    with open(path, 'w') as f:
+        yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
+
+
+def run_command(command: str):
+    """Executes a shell command from the project root directory."""
+    result = subprocess.run(command, shell=True, text=True, cwd=str(PROJECT_ROOT))
+    if result.returncode != 0:
+        raise RuntimeError(f"Command execution failed: {command}")
+
+
+def main():
+    if not BASE_CONFIG_PATH.exists():
+        raise FileNotFoundError(f"Base configuration not found at {BASE_CONFIG_PATH}")
+
+    base_config = load_base_config(BASE_CONFIG_PATH)
+    
+    # --------------------------------------------------------------------------
+    # Define Baseline Experiments
+    # --------------------------------------------------------------------------
+    experiments =[]
+
+    # 1. STL-Q (Single Task: Streamflow)
+    cfg_stl_q = deepcopy(base_config)
+    cfg_stl_q['experiment']['name'] = "baseline_stl_q"
+    # Isolate streamflow target
+    cfg_stl_q['data']['targets'] =[t for t in cfg_stl_q['data']['targets'] if 'streamflow' in t['name'].lower()]
+    # Dummy expert value since it's a single task
+    cfg_stl_q['model']['cgc']['task_experts'] =[2] 
+    experiments.append({
+        "name": "STL-Streamflow",
+        "cfg": cfg_stl_q,
+        "weights": "streamflow=1.0"
+    })
+
+    # 2. STL-ET (Single Task: Evapotranspiration)
+    cfg_stl_et = deepcopy(base_config)
+    cfg_stl_et['experiment']['name'] = "baseline_stl_et"
+    # Isolate evapotranspiration target
+    cfg_stl_et['data']['targets'] =[t for t in cfg_stl_et['data']['targets'] if 'evapotranspiration' in t['name'].lower()]
+    cfg_stl_et['model']['cgc']['task_experts'] = [2]
+    experiments.append({
+        "name": "STL-Evapotranspiration",
+        "cfg": cfg_stl_et,
+        "weights": "evapotranspiration=1.0"
+    })
+
+    # 3. Hard-MTL (Traditional Hard Parameter Sharing)
+    cfg_hard = deepcopy(base_config)
+    cfg_hard['experiment']['name'] = "baseline_hard_mtl"
+    # CRITICAL: Setting task-specific experts to 0 forces the model to degenerate 
+    # into a conventional hard-sharing network (utilizing ONLY shared experts).
+    cfg_hard['model']['cgc']['task_experts'] = [0, 0]
+    experiments.append({
+        "name": "Hard-Sharing MTL",
+        "cfg": cfg_hard,
+        # Maintain consistent weights with the primary CGC model
+        "weights": "streamflow=1.0 evapotranspiration=0.1" 
+    })
+
+    # --------------------------------------------------------------------------
+    # Execute Experiments
+    # --------------------------------------------------------------------------
+    print(f"\n{'='*80}")
+    print(f"[INFO] Commencing Baseline Ablation Studies ({len(experiments)} Models).")
+    print(f"       Project Root: {PROJECT_ROOT}")
+    print(f"{'='*80}\n")
+
+    for idx, exp in enumerate(experiments, start=1):
+        exp_title = exp["name"]
+        cfg = exp["cfg"]
+        weights = exp["weights"]
         
-        data_cfg = config.get('data', {})
-        model_cfg = config.get('model', config)
+        exp_dir_name = cfg['experiment']['name']
+        temp_yaml_path = PROJECT_ROOT / f"temp_{exp_dir_name}.yaml"
         
-        self.task_names = [t['name'] for t in data_cfg.get('targets', [])]
+        print(f"\n{'='*80}")
+        print(f" [RUN {idx:02d}/{len(experiments):02d}] Evaluating Baseline: {exp_title}")
+        print(f" Loss Weights: {weights}")
+        print(f"{'='*80}\n")
         
-        self.categorical_features = data_cfg.get('categorical_static_features', [])
-        self.categorical_embeddings = nn.ModuleDict()
-        total_cat_embed_dim = 0
+        save_temp_config(cfg, temp_yaml_path)
         
-        for feat in self.categorical_features:
-            num_classes = data_cfg.get('categorical_num_classes', {}).get(feat, 150)
-            embed_dim = data_cfg.get('categorical_embed_dims', {}).get(feat, 8)
-            self.categorical_embeddings[feat] = nn.Embedding(num_classes + 1, embed_dim, padding_idx=0)
-            nn.init.normal_(self.categorical_embeddings[feat].weight, mean=0.0, std=0.1)
-            total_cat_embed_dim += embed_dim
+        try:
+            # Execute Training Phase
+            print(f"[INFO] Launching Training Phase for {exp_title}...")
+            train_cmd = f"python {str(MAIN_SCRIPT)} --config {str(temp_yaml_path)} --mode train --loss_weights {weights}"
+            run_command(train_cmd)
             
-        num_numerical_features = len(data_cfg.get('static_features', [])) + len(data_cfg.get('dynamic_features', []))
-        total_input_dim = num_numerical_features + total_cat_embed_dim
-        
-        encoder_config = model_cfg['encoder']
-        self.encoder = FeatureEncoder(
-            input_dim=total_input_dim,
-            hidden_dim=encoder_config['hidden_dim'],
-            num_layers=encoder_config['num_layers'],
-            bidirectional=encoder_config.get('bidirectional', False),
-            encoder_type=encoder_config['type'],
-            dropout_rate=model_cfg.get('cgc', {}).get('dropout_rate', 0.5)
-        )
-        
-        combined_dim = self.encoder.output_dim
-        
-        self.task_towers = nn.ModuleList()
-        for tower_config in model_cfg['task_towers']:
-            tower = TaskTower(
-                input_dim=combined_dim,
-                hidden_dim=tower_config['hidden_dim'],
-                num_layers=tower_config['num_layers'],
-                tower_type=tower_config.get('type', 'mlp'),
-                output_head_type=tower_config.get('output_head', 'regression'),
-                output_dim=data_cfg.get('prediction_horizon', 1),
-                dropout=model_cfg.get('cgc', {}).get('dropout_rate', 0.5)
-            )
-            self.task_towers.append(tower)
+            # Execute Testing Phase
+            print(f"\n[INFO] Launching Testing Phase & NetCDF Export...")
+            test_cmd = f"python {str(MAIN_SCRIPT)} --config {str(temp_yaml_path)} --mode test --loss_weights {weights}"
+            run_command(test_cmd)
+            
+        except Exception as e:
+            print(f"\n[ERROR] Baseline {exp_title} failed. Details: {e}")
+        finally:
+            # Ensure workspace remains clean
+            if temp_yaml_path.exists():
+                os.remove(temp_yaml_path)
+                
+    print(f"\n{'='*80}")
+    print("[SUCCESS] All baseline experiments completed successfully.")
+    print(f"{'='*80}\n")
 
-    def forward(self, x: torch.Tensor, categorical_features: Optional[torch.Tensor] = None, **kwargs) -> Dict[str, torch.Tensor]:
-        if categorical_features is not None and len(self.categorical_features) > 0:
-            cat_embeds = []
-            for i, feat in enumerate(self.categorical_features):
-                idx = categorical_features[:, :, i].long()
-                cat_embeds.append(self.categorical_embeddings[feat](idx))
-            cat_concat = torch.cat(cat_embeds, dim=-1)
-            cat_concat = F.dropout(cat_concat, p=0.3, training=self.training)
-            x = torch.cat([x, cat_concat], dim=-1)
-            
-        encoded_time_features = self.encoder(x)
-        
-        predictions = {}
-        for i, task_name in enumerate(self.task_names):
-            task_pred = self.task_towers[i](encoded_time_features)
-            predictions[task_name] = task_pred['y_hat'] if isinstance(task_pred, dict) else task_pred
-            
-        return predictions
+if __name__ == "__main__":
+    main()

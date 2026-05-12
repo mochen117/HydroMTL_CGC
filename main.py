@@ -1,8 +1,8 @@
 # ==============================================================================
 # Copyright (c) 2024-2026. All Rights Reserved.
 # Description: Main execution pipeline for HydroMTL_CGC.
-# Orchestrates training, independent testing, and NetCDF exports.
-# Supports dynamic CLI overrides for ablation studies (STL vs Hard-MTL vs CGC).
+# Orchestrates training, independent testing, and comprehensive data exports
+# (CSV for per-basin metrics, NetCDF for predictions and expert routing weights).
 # ==============================================================================
 
 import os
@@ -17,6 +17,7 @@ import multiprocessing as mp
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="sklearn")
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="numpy")
 
+# Environment patch for C++ dynamic libraries
 conda_prefix = os.environ.get('CONDA_PREFIX')
 if conda_prefix:
     lib_path = os.path.join(conda_prefix, 'lib')
@@ -90,11 +91,9 @@ def main():
     parser.add_argument("--experiment_name", type=str, default=None)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=42)
-    
-    # Dynamic Override Arguments for Ablation Studies
     parser.add_argument("--loss_weights", type=str, nargs='+', default=None)
-    parser.add_argument("--targets", type=str, nargs='+', default=None, help="Override targets, e.g., streamflow evapotranspiration")
-    parser.add_argument("--task_experts", type=int, nargs='+', default=None, help="Override task experts, e.g., 0 0 for Hard-MTL")
+    parser.add_argument("--targets", type=str, nargs='+', default=None, help="Override targets for ablation")
+    parser.add_argument("--task_experts", type=int, nargs='+', default=None, help="Override task experts")
     
     args = parser.parse_args()
 
@@ -106,13 +105,11 @@ def main():
 
     override_msgs =[]
     
-    # 1. Override Targets (For STL experiments)
     if args.targets is not None:
-        valid_targets = [t for t in config.data.targets if t.name.lower() in[tgt.lower() for tgt in args.targets]]
+        valid_targets =[t for t in config.data.targets if t.name.lower() in [tgt.lower() for tgt in args.targets]]
         config.data.targets = valid_targets
         override_msgs.append(f"Targets filtered -> {[t.name for t in valid_targets]}")
 
-    # 2. Override Loss Weights
     if args.loss_weights is not None:
         try:
             weight_dict = {item.split('=')[0]: float(item.split('=')[1]) for item in args.loss_weights}
@@ -124,8 +121,7 @@ def main():
                         override_msgs.append(f"Target '{target.name}' weight -> {v}")
         except Exception:
             sys.exit(1)
-
-    # 3. Override Task Experts (For Hard-MTL baseline)
+            
     if args.task_experts is not None:
         config.model.cgc.task_experts = args.task_experts
         override_msgs.append(f"Task Experts -> {args.task_experts}")
@@ -135,6 +131,7 @@ def main():
     data_root = Path(config.data.data_root)
     nc_files = list(data_root.glob("gage_*.nc"))
     basin_ids =[f.stem.replace("gage_", "") for f in nc_files]
+    # Sorting ensures consistent geographic ordering for NC files export
     basin_ids.sort()
 
     print(f"\n{'='*85}")
@@ -163,8 +160,6 @@ def main():
         scaler=global_scaler,
         use_wandb=False
     )
-
-    epochs_config = int(getattr(config.training, 'epochs', 100))
 
     if args.mode == "train":
         print("Commencing training phase...\n")
@@ -200,9 +195,13 @@ def main():
             print(f"  {k:<30}: {v:.4f}")
         print("="*85)
 
+        # =====================================================================
+        # EXPORT PER-BASIN METRICS TO CSV
+        # =====================================================================
         print("\nExporting per-basin performance metrics to CSV...")
         if per_basin_metrics:
             df_metrics = pd.DataFrame.from_dict(per_basin_metrics, orient='index')
+            # Map batch basin indices (0...N) back to real CAMELS gage_ids
             df_metrics.index = [basin_ids[i] for i in df_metrics.index]
             df_metrics.index.name = 'gage_id'
             
@@ -210,6 +209,9 @@ def main():
             df_metrics.to_csv(csv_save_path)
             print(f"Successfully saved to: {csv_save_path}")
 
+        # =====================================================================
+        # EXPORT RESULTS TO NETCDF (Predictions + Gate Weights)
+        # =====================================================================
         print("Exporting predictions and gate routing weights to NetCDF...")
         
         seq_len = config.data.get('sequence_length', 365)

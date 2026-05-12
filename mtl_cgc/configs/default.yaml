@@ -99,8 +99,8 @@ data:
   normalize: true
   fill_missing: true
   batch_size: 100
-  num_workers: 16
-  prefetch_factor: 4
+  num_workers: 4
+  prefetch_factor: 2
 
 model:
   cgc:

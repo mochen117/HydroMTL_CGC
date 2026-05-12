@@ -1,5 +1,5 @@
 experiment:
-  name: grid_sl180_hd128_se2_dp3_lr001
+  name: grid_sl180_hd256_se2_dp3_lr0005
   task: streamflow_et_prediction
   timestamp: null
   save_dir: ./experiments
@@ -77,20 +77,20 @@ data:
   normalize: true
   fill_missing: true
   batch_size: 100
-  num_workers: 16
-  prefetch_factor: 4
+  num_workers: 4
+  prefetch_factor: 2
 model:
   cgc:
     shared_experts: 2
     task_experts:
     - 4
     - 2
-    expert_hidden_dim: 128
+    expert_hidden_dim: 256
     use_attention_gate: true
     dropout_rate: 0.3
   encoder:
     type: lstm
-    hidden_dim: 128
+    hidden_dim: 256
     num_layers: 2
     bidirectional: false
   task_towers:
@@ -109,7 +109,7 @@ model:
       requires_precipitation: true
 training:
   optimizer: adamw
-  learning_rate: 0.001
+  learning_rate: 0.0005
   weight_decay: 0.05
   clip_grad_norm: 1.0
   loss:

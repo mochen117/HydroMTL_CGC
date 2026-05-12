@@ -2,7 +2,8 @@
 # Copyright (c) 2024-2026. All Rights Reserved.
 # Description: Advanced Model Trainer for Hydrological MTL Framework.
 # Features: Masked RMSE computation, Mixed Precision Training (AMP), 
-# robust progress bar management, and comprehensive TensorBoard tracking.
+# robust progress bar management, TensorBoard tracking, and per-basin metrics.
+# Refactored for maximum modularity and adherence to the DRY principle.
 # ==============================================================================
 
 import sys
@@ -65,7 +66,6 @@ class HydroTrainer:
     Orchestrates the training, validation, and testing loops.
     Expected Model Forward Signature:
         forward(...) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]
-        (Predictions Dictionary, Gate Weights Dictionary)
     """
     def __init__(
         self, 
@@ -85,12 +85,10 @@ class HydroTrainer:
         self.use_wandb = use_wandb
         self.basin_scalers = basin_scalers
 
-        # Parse task configurations
-        self.targets_cfg = self.config.data.get('targets', [])
+        self.targets_cfg = self.config.data.get('targets',[])
         self.task_names =[str(t.get('name', '')).lower() for t in self.targets_cfg]
         self.task_weights = {str(t.get('name', '')).lower(): float(t.get('loss_weight', 1.0)) for t in self.targets_cfg}
         
-        # Training parameters
         self.clip_grad_norm = float(getattr(self.config.training, 'clip_grad_norm', 1.0))
         self.use_amp = getattr(self.config.training, 'use_amp', False)
         self.amp_scaler = GradScaler(enabled=self.use_amp)
@@ -99,14 +97,12 @@ class HydroTrainer:
         self.best_val_loss = float('inf')
         self.train_history = {'train_loss':[], 'val_loss': [], 'train_metrics': [], 'val_metrics':[]}
 
-        # Setup optimization components
         self.optimizer = self._setup_optimizer()
         base_scheduler = self._setup_scheduler()
         
         self.callbacks = CallbackHandler()
         self._setup_callbacks(base_scheduler)
         
-        # Initialize TensorBoard Writer
         self.writer = None
         logging_cfg = getattr(self.config, 'logging', {})
         if isinstance(logging_cfg, dict) and logging_cfg.get('tensorboard', False):
@@ -159,6 +155,7 @@ class HydroTrainer:
             self.callbacks.add_callback(LearningRateScheduler(base_scheduler, verbose=False))
 
     def _unpack_batch(self, batch_data: Any) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Dict, Optional[np.ndarray]]:
+        """Extracts and formats batch elements into appropriate structures."""
         if not isinstance(batch_data, dict):
             raise ValueError("Dataset must return a dictionary format mapping inputs and targets.")
 
@@ -189,6 +186,50 @@ class HydroTrainer:
             return torch.from_numpy(v).to(self.device).float()
         return torch.tensor(v, device=self.device, dtype=torch.float32)
 
+    def _sanitize_predictions(self, preds_raw: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        """Clamps raw model predictions to prevent NaN/Inf propagation during metric computation."""
+        preds_dict = {}
+        for k, v in preds_raw.items():
+            k_lower = str(k).lower()
+            if isinstance(v, dict):
+                preds_dict[k_lower] = {
+                    'means': torch.clamp(torch.nan_to_num(v['means']), -10.0, 10.0), 
+                    'weights': torch.clamp(torch.nan_to_num(v['weights']), 0.0, 1.0)
+                }
+            else:
+                preds_dict[k_lower] = torch.clamp(torch.nan_to_num(v), -10.0, 10.0)
+        return preds_dict
+
+    def _compute_batch_loss(self, preds_dict: Dict, targets_dev: Dict, stat_num: Optional[torch.Tensor]) -> torch.Tensor:
+        """Computes multi-task loss utilizing either a custom criterion or masked RMSE."""
+        if self.criterion is not None:
+            if hasattr(self.criterion, 'stat') and stat_num is not None:
+                return self.criterion(preds_dict, targets_dev, stat_num)
+            return self.criterion(preds_dict, targets_dev)
+            
+        valid_tasks =[t for t in self.task_names if t in preds_dict and t in targets_dev]
+        if valid_tasks:
+            return sum([self.task_weights.get(t, 1.0) * masked_rmse(preds_dict[t], targets_dev[t]) for t in valid_tasks])
+        
+        # Fallback to prevent graph disconnection
+        return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+    def _collect_batch_metrics(self, preds_dict: Dict, targets_dev: Dict, task_loss_sums: Dict, all_preds: Dict, all_targets: Dict):
+        """Extracts and flattens batch predictions for subsequent spatial evaluation."""
+        for t in self.task_names:
+            if t in preds_dict and t in targets_dev:
+                t_loss = masked_rmse(preds_dict[t], targets_dev[t])
+                task_loss_sums[t] += float(torch.nan_to_num(t_loss).item())
+                
+                p_val = preds_dict[t]
+                if isinstance(p_val, dict) and 'means' in p_val:
+                    p_val = torch.sum(p_val['means'].squeeze(-1) * p_val['weights'], dim=1)
+                else:
+                    p_val = p_val.squeeze(-1)
+                    
+                all_preds[t].append(p_val.detach().cpu().numpy().flatten())
+                all_targets[t].append(targets_dev[t].detach().cpu().numpy().flatten())
+
     def train_epoch(self, loader: DataLoader, pbar: Optional[tqdm] = None) -> Tuple[float, Dict[str, float], Dict[str, float]]:
         self.model.train()
         total_loss = 0.0
@@ -196,7 +237,9 @@ class HydroTrainer:
         valid_batches = 0
         current_lr = self.optimizer.param_groups[0]['lr']
         
-        all_preds, all_targets, all_basin_idxs, all_stat_nums = {t: [] for t in self.task_names}, {t:[] for t in self.task_names}, [],[]
+        all_preds = {t: [] for t in self.task_names}
+        all_targets = {t:[] for t in self.task_names}
+        all_basin_idxs, all_stat_nums = [],[]
 
         for batch_data in loader:
             try:
@@ -209,50 +252,27 @@ class HydroTrainer:
                 stat_num_tensor = torch.nan_to_num(self._to_tensor(stat_num), nan=0.0)
                 if stat_cat is not None: 
                     stat_cat = stat_cat.to(self.device, dtype=torch.long)
+                
                 targets_dev = {k: self._to_tensor(v) for k, v in targets_dict.items() if k in self.task_names}
 
                 self.optimizer.zero_grad()
                 
-                # Forward pass with AMP
+                # Forward and Loss with AMP
                 with autocast(enabled=self.use_amp):
                     preds_raw, _ = self.model(dyn_x, stat_num_tensor, stat_cat)
+                    preds_dict = self._sanitize_predictions(preds_raw)
                     
-                    preds_dict = {}
-                    for k, v in preds_raw.items():
-                        k_lower = str(k).lower()
-                        if isinstance(v, dict):
-                            preds_dict[k_lower] = {
-                                'means': torch.clamp(torch.nan_to_num(v['means']), -10.0, 10.0), 
-                                'weights': torch.clamp(torch.nan_to_num(v['weights']), 0.0, 1.0)
-                            }
-                        else:
-                            preds_dict[k_lower] = torch.clamp(torch.nan_to_num(v), -10.0, 10.0)
-
-                    # Loss computation
-                    if self.criterion is not None:
-                        if hasattr(self.criterion, 'stat') and stat_num_tensor is not None:
-                            loss = self.criterion(preds_dict, targets_dev, stat_num_tensor)
-                        else:
-                            loss = self.criterion(preds_dict, targets_dev)
-                    else:
-                        valid_tasks =[t for t in self.task_names if t in preds_dict and t in targets_dev]
-                        if valid_tasks:
-                            loss = sum([self.task_weights.get(t, 1.0) * masked_rmse(preds_dict[t], targets_dev[t]) for t in valid_tasks])
-                        else:
-                            continue
-                    
+                    loss = self._compute_batch_loss(preds_dict, targets_dev, stat_num_tensor)
                     loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=0.0)
+                    
                     if not loss.requires_grad:
                         loss.requires_grad = True
 
-                # Backward pass with AMP scaler
+                # Backward and Optimization using GradScaler
                 self.amp_scaler.scale(loss).backward()
-                
-                # Unscale before gradient clipping
                 self.amp_scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm)
                 
-                # Optimizer step and scaler update
                 self.amp_scaler.step(self.optimizer)
                 self.amp_scaler.update()
                 
@@ -262,19 +282,7 @@ class HydroTrainer:
 
                 # Metric extraction
                 with torch.no_grad():
-                    for t in self.task_names:
-                        if t in preds_dict and t in targets_dev:
-                            task_loss_sums[t] += float(torch.nan_to_num(masked_rmse(preds_dict[t], targets_dev[t])).item())
-                            
-                            p_val = preds_dict[t]
-                            if isinstance(p_val, dict) and 'means' in p_val:
-                                p_val = torch.sum(p_val['means'].squeeze(-1) * p_val['weights'], dim=1)
-                            else:
-                                p_val = p_val.squeeze(-1)
-                                
-                            all_preds[t].append(p_val.detach().cpu().numpy().flatten())
-                            all_targets[t].append(targets_dev[t].detach().cpu().numpy().flatten())
-                    
+                    self._collect_batch_metrics(preds_dict, targets_dev, task_loss_sums, all_preds, all_targets)
                     if basin_idx is not None: 
                         all_basin_idxs.append(basin_idx.flatten())
                     if stat_num_tensor is not None: 
@@ -288,6 +296,7 @@ class HydroTrainer:
                 if pbar is not None:
                     pbar.update(1)
 
+        # Sequence flattening and metric computation
         preds_concat = {t: (np.concatenate(all_preds[t]) if all_preds[t] else np.array([])) for t in self.task_names}
         targets_concat = {t: (np.concatenate(all_targets[t]) if all_targets[t] else np.array([])) for t in self.task_names}
         basin_idxs_concat = np.concatenate(all_basin_idxs) if len(all_basin_idxs) > 0 else np.array([])
@@ -302,7 +311,7 @@ class HydroTrainer:
     @torch.no_grad()
     def evaluate(self, loader: DataLoader, pbar: Optional[tqdm] = None, desc: str = "Evaluating") -> Tuple:
         """
-        Executes validation or test loop.
+        Executes validation or independent test loop.
         Returns:
             (avg_loss, avg_tasks, final_metrics, p_phys, t_phys, basin_idxs, gates_concat, per_basin_metrics)
         """
@@ -311,17 +320,22 @@ class HydroTrainer:
         task_loss_sums = {t: 0.0 for t in self.task_names}
         valid_batches = 0
         
-        all_preds, all_targets, all_basin_idxs, all_stat_nums = {t:[] for t in self.task_names}, {t: [] for t in self.task_names}, [],[]
+        all_preds = {t:[] for t in self.task_names}
+        all_targets = {t:[] for t in self.task_names}
+        all_basin_idxs, all_stat_nums = [],[]
         all_gates = {}
 
         internal_pbar = False
         if pbar is None:
-            pbar = tqdm(total=len(loader), desc=desc, leave=True, file=sys.stdout, ncols=100)
+            pbar = tqdm(total=len(loader), desc=desc, leave=True, file=sys.stdout, ncols=100, mininterval=10.0)
             internal_pbar = True
 
         for batch_data in loader:
             try:
                 dyn_x, stat_num, stat_cat, targets_dict, basin_idx = self._unpack_batch(batch_data)
+
+                if dyn_x is None or not targets_dict:
+                    continue
 
                 dyn_x = torch.nan_to_num(self._to_tensor(dyn_x), nan=0.0)
                 stat_num_tensor = torch.nan_to_num(self._to_tensor(stat_num), nan=0.0)
@@ -329,55 +343,22 @@ class HydroTrainer:
                     stat_cat = stat_cat.to(self.device, dtype=torch.long)
                 targets_dev = {k: self._to_tensor(v) for k, v in targets_dict.items() if k in self.task_names}
 
-                # Forward pass: extract BOTH predictions and gate_weights
                 with autocast(enabled=self.use_amp):
                     preds_raw, gates_raw = self.model(dyn_x, stat_num_tensor, stat_cat)
-                
-                # Store gating weights for interpretability (CGC analysis)
-                for k, v in gates_raw.items():
-                    if k not in all_gates: 
-                        all_gates[k] = []
-                    all_gates[k].append(v.cpu().numpy())
-
-                preds_dict = {}
-                for k, v in preds_raw.items():
-                    k_lower = str(k).lower()
-                    if isinstance(v, dict):
-                        preds_dict[k_lower] = {
-                            'means': torch.clamp(torch.nan_to_num(v['means']), -10.0, 10.0), 
-                            'weights': torch.clamp(torch.nan_to_num(v['weights']), 0.0, 1.0)
-                        }
-                    else:
-                        preds_dict[k_lower] = torch.clamp(torch.nan_to_num(v), -10.0, 10.0)
-                
-                if self.criterion is not None:
-                    if hasattr(self.criterion, 'stat') and stat_num_tensor is not None:
-                        loss = self.criterion(preds_dict, targets_dev, stat_num_tensor)
-                    else:
-                        loss = self.criterion(preds_dict, targets_dev)
-                else:
-                    valid_tasks =[t for t in self.task_names if t in preds_dict and t in targets_dev]
-                    if valid_tasks:
-                        loss = sum([self.task_weights.get(t, 1.0) * masked_rmse(preds_dict[t], targets_dev[t]) for t in valid_tasks])
-                    else:
-                        loss = torch.tensor(0.0, device=self.device)
+                    preds_dict = self._sanitize_predictions(preds_raw)
+                    loss = self._compute_batch_loss(preds_dict, targets_dev, stat_num_tensor)
                     
                 loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=0.0)
                 total_loss += float(loss.item())
                 valid_batches += 1
 
-                for t in self.task_names:
-                    if t in preds_dict and t in targets_dev:
-                        task_loss_sums[t] += float(torch.nan_to_num(masked_rmse(preds_dict[t], targets_dev[t])).item())
-                        
-                        p_val = preds_dict[t]
-                        if isinstance(p_val, dict) and 'means' in p_val:
-                            p_val = torch.sum(p_val['means'].squeeze(-1) * p_val['weights'], dim=1)
-                        else:
-                            p_val = p_val.squeeze(-1)
-                        
-                        all_preds[t].append(p_val.detach().cpu().numpy().flatten())
-                        all_targets[t].append(targets_dev[t].detach().cpu().numpy().flatten())
+                # Capture gate weights for interpretability
+                for k, v in gates_raw.items():
+                    if k not in all_gates: 
+                        all_gates[k] = []
+                    all_gates[k].append(v.cpu().numpy())
+
+                self._collect_batch_metrics(preds_dict, targets_dev, task_loss_sums, all_preds, all_targets)
                 
                 if basin_idx is not None: 
                     all_basin_idxs.append(basin_idx.flatten())
@@ -399,7 +380,6 @@ class HydroTrainer:
         targets_concat = {t: (np.concatenate(all_targets[t]) if all_targets[t] else np.array([])) for t in self.task_names}
         basin_idxs_concat = np.concatenate(all_basin_idxs) if len(all_basin_idxs) > 0 else np.array([])
         stat_nums_concat = np.concatenate(all_stat_nums, axis=0) if all_stat_nums else None
-        
         gates_concat = {k: np.concatenate(v, axis=0) for k, v in all_gates.items()} if all_gates else {}
 
         p_phys, t_phys = self._apply_inverse_scaling(preds_concat, targets_concat, basin_idxs_concat, stat_nums_concat)
@@ -443,6 +423,7 @@ class HydroTrainer:
                     try:
                         p_transformed = scaler.inverse_transform(preds_concat[t][mask])
                         t_transformed = scaler.inverse_transform(targets_concat[t][mask])
+                        
                         p_phys[t][mask] = p_transformed if not np.isnan(p_transformed).any() else preds_concat[t][mask]
                         t_phys[t][mask] = t_transformed if not np.isnan(t_transformed).any() else targets_concat[t][mask]
                     except Exception:
@@ -458,8 +439,8 @@ class HydroTrainer:
 
     def _compute_spatial_median_metrics(self, p_phys: Dict, t_phys: Dict, basin_idxs: np.ndarray) -> Tuple[Dict[str, float], Dict[int, Dict[str, float]]]:
         unique_basins = np.unique(basin_idxs) if len(basin_idxs) > 0 else np.array([])
-        raw_metrics = getattr(self.config.evaluation, 'metrics', ['nse', 'kge', 'rmse', 'bias', 'corr'])
-        target_metrics = [m.lower() for m in raw_metrics]
+        raw_metrics = getattr(self.config.evaluation, 'metrics',['nse', 'kge', 'rmse', 'bias', 'corr'])
+        target_metrics =[m.lower() for m in raw_metrics]
         
         final_metrics = {}
         per_basin_metrics = {}
@@ -475,14 +456,14 @@ class HydroTrainer:
                 if mask.sum() < 1: 
                     continue
                 
-                p_b = p_phys[task][mask].flatten()
-                t_b = t_phys[task][mask].flatten()
+                p_b_valid = p_phys[task][mask].flatten()
+                t_b_valid = t_phys[task][mask].flatten()
                 
-                valid_idx = ~np.isnan(t_b) & ~np.isnan(p_b)
+                valid_idx = ~np.isnan(t_b_valid) & ~np.isnan(p_b_valid)
                 if valid_idx.sum() < 1: 
                     continue
                 
-                res = compute_metrics({task: torch.from_numpy(p_b[valid_idx])}, {task: torch.from_numpy(t_b[valid_idx])}, target_metrics)
+                res = compute_metrics({task: torch.from_numpy(p_b_valid[valid_idx])}, {task: torch.from_numpy(t_b_valid[valid_idx])}, target_metrics)
                 
                 b_idx_int = int(b_idx)
                 if b_idx_int not in per_basin_metrics:
@@ -519,11 +500,11 @@ class HydroTrainer:
         try:
             for epoch in range(self.current_epoch + 1, epochs + 1):
                 self.current_epoch = epoch
-                pbar = tqdm(total=total_batches, desc=f"Epoch {epoch}/{epochs} [Train]", leave=True, file=sys.stdout, ncols=100)
+                pbar = tqdm(total=total_batches, desc=f"Epoch {epoch}/{epochs} [Train]", leave=True, file=sys.stdout, ncols=100, mininterval=10.0)
                 
                 t_loss, t_tasks, t_metrics = self.train_epoch(train_loader, pbar)
                 
-                pbar.set_description(f"Epoch {epoch}/{epochs}[Valid]")
+                pbar.set_description(f"Epoch {epoch}/{epochs} [Valid]")
                 v_loss, v_tasks, v_metrics, _, _, _, _, _ = self.evaluate(val_loader, pbar)
                 pbar.close()
 
@@ -546,7 +527,6 @@ class HydroTrainer:
 
                 self._print_summary(epoch, epochs, current_lr, t_loss, t_tasks, v_loss, v_tasks, t_metrics, v_metrics)
                 
-                # TensorBoard Logging
                 if self.writer is not None:
                     self.writer.add_scalar('Global/Train_Loss', t_loss, epoch)
                     self.writer.add_scalar('Global/Valid_Loss', v_loss, epoch)
