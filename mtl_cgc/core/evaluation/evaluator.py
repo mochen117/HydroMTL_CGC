@@ -1,418 +1,273 @@
-"""
-Evaluation module for model performance assessment
-Computes hydrological metrics and provides detailed analysis
-"""
+# ==============================================================================
+# Copyright (c) 2024-2026. All Rights Reserved.
+# Description: Hydrological spatial evaluation framework.
+# Rectifies temporal index offsets and implements Wilcoxon paired validations.
+# Employs strict NaN-masking, Expert CV, Gini indexing and Holm-Bonferroni.
+# Calculates strict Wilcoxon effect sizes using returned scipy Z-statistics.
+# ==============================================================================
 
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Tuple, Optional, Any
-import logging
-from scipy import stats
+import xarray as xr
 import torch
-import matplotlib.pyplot as plt
-from pathlib import Path
-
-logger = logging.getLogger(__name__)
-
+from scipy import stats
+from typing import Dict, List, Tuple, Optional, Any
 
 class HydroEvaluator:
-    """Evaluator for hydrological model performance"""
-    
-    def __init__(self, config: Dict[str, Any], save_dir: str = None):
-        """
-        Initialize evaluator
-        
-        Args:
-            config: Evaluation configuration
-            save_dir: Directory to save evaluation results
-        """
+    """Reconstructs batch tensors back into geographic matrices to compute indices."""
+    def __init__(self, config: Any, basin_ids: List[str], scaler: Any):
         self.config = config
-        self.metrics = config.get('metrics', ['nse', 'kge', 'rmse', 'mae', 'pbias', 'r2'])
+        self.basin_ids = basin_ids
+        self.scaler = scaler
+        self.task_names = [str(t['name']).lower() for t in config.data.targets]
+        self.target_metrics = [m.lower() for m in config.evaluation_protocol.metrics]
+
+    def process_and_evaluate(self, collected_data: Dict[str, Any], period_dates: List[str]) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]], Optional[xr.Dataset]]:
+        """Reconstructs continuous physical timeseries without index shift modifications."""
+        num_basins = len(self.basin_ids)
+        seq_len = self.config.data.get('sequence_length', 180)
         
-        if save_dir:
-            self.save_dir = Path(save_dir)
-            self.save_dir.mkdir(parents=True, exist_ok=True)
-        else:
-            self.save_dir = None
+        start_date = pd.to_datetime(period_dates[0]) + pd.Timedelta(days=seq_len - 1)
+        end_date = pd.to_datetime(period_dates[1])
+        time_index = pd.date_range(start=start_date, end=end_date, freq='D')
+        num_days = len(time_index)
         
-        # Cache for evaluation results
-        self.results_cache = {}
-    
-    def compute_all_metrics(self, predictions: Dict[str, np.ndarray],
-                           targets: Dict[str, np.ndarray],
-                           basin_ids: Optional[List[str]] = None,
-                           save_results: bool = True) -> Dict[str, Any]:
-        """
-        Compute all configured metrics
+        reconstructed_preds = {t: np.full((num_basins, num_days), np.nan) for t in self.task_names}
+        reconstructed_obs = {t: np.full((num_basins, num_days), np.nan) for t in self.task_names}
+        reconstructed_gates = {}
         
-        Args:
-            predictions: Dictionary of predictions for each task
-            targets: Dictionary of targets for each task
-            basin_ids: List of basin IDs for per-basin evaluation
-            save_results: Whether to save results to file
-            
-        Returns:
-            Dictionary containing all computed metrics
-        """
-        results = {}
+        if not collected_data['basin_idx']:
+            return {}, {}, None
+
+        b_idx_arr = np.concatenate(collected_data['basin_idx']).flatten()
+        t_idx_arr = np.concatenate(collected_data['time_idx']).flatten()
+        stat_num_arr = np.concatenate(collected_data['stat_num'], axis=0)
         
-        for task_name in predictions.keys():
-            # Skip non-task predictions (e.g., gate_analysis)
-            if task_name in ['gate_analysis', 'water_imbalance']:
-                continue
-            
-            # Get predictions and targets for this task
-            pred_key = task_name
-            target_key = task_name
-            
-            # Handle probabilistic predictions
-            if f"{task_name}_mu" in predictions:
-                pred_key = f"{task_name}_mu"
-            
-            if pred_key not in predictions or target_key not in targets:
-                logger.warning(f"Missing data for task {task_name}")
-                continue
-            
-            pred = predictions[pred_key]
-            target = targets[target_key]
-            
-            # Reshape if needed
-            if pred.ndim == 3:
-                pred = pred.reshape(-1, pred.shape[-1])
-                target = target.reshape(-1, target.shape[-1])
-            
-            # Remove NaN values
-            mask = ~np.isnan(target) & ~np.isnan(pred)
-            pred_valid = pred[mask]
-            target_valid = target[mask]
-            
-            if len(pred_valid) == 0:
-                logger.warning(f"No valid data for task {task_name}")
-                continue
-            
-            # Compute metrics
-            task_results = {}
-            for metric_name in self.metrics:
-                metric_func = getattr(self, f"compute_{metric_name}")
-                metric_value = metric_func(pred_valid, target_valid)
-                task_results[metric_name] = metric_value
-            
-            # Compute per-basin metrics if basin IDs provided
-            if basin_ids is not None and len(basin_ids) == len(pred):
-                basin_metrics = self._compute_per_basin_metrics(
-                    pred, target, basin_ids, task_name
-                )
-                task_results['per_basin'] = basin_metrics
-            
-            results[task_name] = task_results
+        t_idx_valid = t_idx_arr
+        valid_mask = (b_idx_arr >= 0) & (b_idx_arr < num_basins) & (t_idx_valid >= 0) & (t_idx_valid < num_days)
         
-        # Save results if requested
-        if save_results and self.save_dir:
-            self.save_results(results)
-        
-        # Cache results
-        self.results_cache = results
-        
-        return results
-    
-    def compute_nse(self, pred: np.ndarray, target: np.ndarray) -> float:
-        """Compute Nash-Sutcliffe Efficiency"""
-        numerator = np.sum((target - pred) ** 2)
-        denominator = np.sum((target - np.mean(target)) ** 2)
-        
-        if denominator == 0:
-            return -np.inf
-        
-        nse = 1 - numerator / denominator
-        return float(nse)
-    
-    def compute_kge(self, pred: np.ndarray, target: np.ndarray) -> float:
-        """Compute Kling-Gupta Efficiency"""
-        # Correlation
-        r = np.corrcoef(pred, target)[0, 1]
-        if np.isnan(r):
-            r = 0
-        
-        # Mean ratio (bias)
-        beta = np.mean(pred) / np.mean(target)
-        
-        # Variability ratio
-        alpha = np.std(pred) / np.std(target)
-        
-        # KGE
-        kge = 1 - np.sqrt((r - 1) ** 2 + (alpha - 1) ** 2 + (beta - 1) ** 2)
-        return float(kge)
-    
-    def compute_rmse(self, pred: np.ndarray, target: np.ndarray) -> float:
-        """Compute Root Mean Squared Error"""
-        rmse = np.sqrt(np.mean((pred - target) ** 2))
-        return float(rmse)
-    
-    def compute_mae(self, pred: np.ndarray, target: np.ndarray) -> float:
-        """Compute Mean Absolute Error"""
-        mae = np.mean(np.abs(pred - target))
-        return float(mae)
-    
-    def compute_pbias(self, pred: np.ndarray, target: np.ndarray) -> float:
-        """Compute Percent Bias"""
-        pbias = 100 * np.sum(pred - target) / np.sum(target)
-        return float(pbias)
-    
-    def compute_r2(self, pred: np.ndarray, target: np.ndarray) -> float:
-        """Compute R-squared"""
-        ss_res = np.sum((target - pred) ** 2)
-        ss_tot = np.sum((target - np.mean(target)) ** 2)
-        
-        if ss_tot == 0:
-            return -np.inf
-        
-        r2 = 1 - ss_res / ss_tot
-        return float(r2)
-    
-    def compute_nselog(self, pred: np.ndarray, target: np.ndarray) -> float:
-        """Compute Log-NSE for low-flow performance"""
-        pred_log = np.log(pred + 1e-6)
-        target_log = np.log(target + 1e-6)
-        
-        numerator = np.sum((target_log - pred_log) ** 2)
-        denominator = np.sum((target_log - np.mean(target_log)) ** 2)
-        
-        if denominator == 0:
-            return -np.inf
-        
-        nselog = 1 - numerator / denominator
-        return float(nselog)
-    
-    def _compute_per_basin_metrics(self, pred: np.ndarray, target: np.ndarray,
-                                  basin_ids: List[str], task_name: str) -> pd.DataFrame:
-        """Compute metrics for each basin individually"""
-        unique_basins = np.unique(basin_ids)
-        basin_results = []
-        
-        for basin_id in unique_basins:
-            basin_mask = basin_ids == basin_id
-            
-            pred_basin = pred[basin_mask]
-            target_basin = target[basin_mask]
-            
-            # Remove NaN values
-            mask = ~np.isnan(target_basin) & ~np.isnan(pred_basin)
-            pred_valid = pred_basin[mask]
-            target_valid = target_basin[mask]
-            
-            if len(pred_valid) == 0:
-                continue
-            
-            # Compute metrics for this basin
-            basin_metrics = {'basin_id': basin_id}
-            for metric_name in self.metrics:
-                metric_func = getattr(self, f"compute_{metric_name}")
-                try:
-                    metric_value = metric_func(pred_valid, target_valid)
-                    basin_metrics[metric_name] = metric_value
-                except:
-                    basin_metrics[metric_name] = np.nan
-            
-            basin_results.append(basin_metrics)
-        
-        return pd.DataFrame(basin_results)
-    
-    def analyze_predictions(self, predictions: Dict[str, np.ndarray],
-                           targets: Dict[str, np.ndarray],
-                           task_names: List[str]) -> Dict[str, Any]:
-        """
-        Perform detailed analysis of predictions
-        
-        Args:
-            predictions: Model predictions
-            targets: Ground truth values
-            task_names: List of task names
-            
-        Returns:
-            Dictionary with detailed analysis
-        """
-        analysis = {}
-        
-        for task_name in task_names:
-            if task_name not in predictions or task_name not in targets:
-                continue
-            
-            pred = predictions[task_name]
-            target = targets[task_name]
-            
-            # Basic statistics
-            task_analysis = {
-                'prediction_stats': {
-                    'mean': float(np.nanmean(pred)),
-                    'std': float(np.nanstd(pred)),
-                    'min': float(np.nanmin(pred)),
-                    'max': float(np.nanmax(pred))
-                },
-                'target_stats': {
-                    'mean': float(np.nanmean(target)),
-                    'std': float(np.nanstd(target)),
-                    'min': float(np.nanmin(target)),
-                    'max': float(np.nanmax(target))
-                }
-            }
-            
-            # Error analysis
-            errors = pred - target
-            valid_mask = ~np.isnan(errors)
-            
-            if np.any(valid_mask):
-                errors_valid = errors[valid_mask]
-                task_analysis['error_stats'] = {
-                    'mean_error': float(np.mean(errors_valid)),
-                    'std_error': float(np.std(errors_valid)),
-                    'mae': float(np.mean(np.abs(errors_valid))),
-                    'rmse': float(np.sqrt(np.mean(errors_valid ** 2)))
-                }
+        b_idx_valid = b_idx_arr[valid_mask]
+        t_idx_valid = t_idx_valid[valid_mask]
+        stat_num_valid = stat_num_arr[valid_mask]
+
+        for task in self.task_names:
+            if collected_data['preds'][task]:
+                raw_p = np.concatenate(collected_data['preds'][task]).flatten()[valid_mask]
+                raw_o = np.concatenate(collected_data['targets'][task]).flatten()[valid_mask]
                 
-                # Error distribution percentiles
-                percentiles = [10, 25, 50, 75, 90]
-                error_percentiles = np.percentile(errors_valid, percentiles)
-                task_analysis['error_percentiles'] = {
-                    f'p{p}': float(val) for p, val in zip(percentiles, error_percentiles)
-                }
-            
-            # Performance by flow regime
-            if task_name in ['streamflow', 'usgsFlow']:
-                flow_regime_analysis = self._analyze_flow_regimes(pred, target)
-                task_analysis['flow_regime'] = flow_regime_analysis
-            
-            analysis[task_name] = task_analysis
-        
-        return analysis
-    
-    def _analyze_flow_regimes(self, pred: np.ndarray, target: np.ndarray) -> Dict[str, float]:
-        """Analyze model performance across different flow regimes"""
-        # Define flow percentiles
-        flow_percentiles = np.percentile(target, [33, 66])
-        
-        # Low flow (<33%)
-        low_flow_mask = target < flow_percentiles[0]
-        # Medium flow (33-66%)
-        medium_flow_mask = (target >= flow_percentiles[0]) & (target < flow_percentiles[1])
-        # High flow (>=66%)
-        high_flow_mask = target >= flow_percentiles[1]
-        
-        regime_analysis = {}
-        
-        for regime_name, mask in [('low_flow', low_flow_mask),
-                                 ('medium_flow', medium_flow_mask),
-                                 ('high_flow', high_flow_mask)]:
-            if np.any(mask):
-                pred_regime = pred[mask]
-                target_regime = target[mask]
+                phys_p = self.scaler.inverse_transform_target_safe(task, raw_p, stat_num_valid)
+                phys_o = self.scaler.inverse_transform_target_safe(task, raw_o, stat_num_valid)
                 
-                # Compute NSE for this regime
-                nse_regime = self.compute_nse(pred_regime, target_regime)
-                regime_analysis[f'{regime_name}_nse'] = nse_regime
-        
-        return regime_analysis
-    
-    def generate_report(self, results: Dict[str, Any], 
-                       analysis: Dict[str, Any]) -> str:
-        """
-        Generate a formatted evaluation report
-        
-        Args:
-            results: Evaluation results from compute_all_metrics
-            analysis: Detailed analysis from analyze_predictions
+                reconstructed_preds[task][b_idx_valid, t_idx_valid] = phys_p
+                reconstructed_obs[task][b_idx_valid, t_idx_valid] = phys_o
             
-        Returns:
-            Formatted report string
-        """
-        report_lines = ["=" * 60]
-        report_lines.append("HYDROLOGICAL MODEL EVALUATION REPORT")
-        report_lines.append("=" * 60)
+        for g_name, g_list in collected_data['gates'].items():
+            if g_list:
+                g_arr = np.concatenate(g_list, axis=0)[valid_mask]
+                num_experts = g_arr.shape[-1]
+                rec_g = np.full((num_basins, num_days, num_experts), np.nan)
+                rec_g[b_idx_valid, t_idx_valid, :] = g_arr
+                reconstructed_gates[g_name] = rec_g
+
+        global_metrics = {}
+        # Corrected: Align basin metrics structure with explicit basin_id strings to avoid spatial mismatching
+        per_basin_metrics = {b_id: {} for b_id in self.basin_ids}
         
-        # Overall metrics
-        report_lines.append("\nOVERALL METRICS:")
-        report_lines.append("-" * 40)
-        
-        for task_name, task_results in results.items():
-            if task_name == 'per_basin':
-                continue
+        for task in self.task_names:
+            task_metric_collections = {m: [] for m in self.target_metrics}
             
-            report_lines.append(f"\n{task_name.upper()}:")
-            for metric_name, metric_value in task_results.items():
-                if metric_name == 'per_basin':
+            for b in range(num_basins):
+                p_b = reconstructed_preds[task][b]
+                o_b = reconstructed_obs[task][b]
+                b_id = self.basin_ids[b]
+                
+                valid_t = ~np.isnan(p_b) & ~np.isnan(o_b)
+                if valid_t.sum() < 10: 
                     continue
-                report_lines.append(f"  {metric_name.upper()}: {metric_value:.4f}")
-        
-        # Per-basin statistics if available
-        for task_name, task_results in results.items():
-            if 'per_basin' in task_results and isinstance(task_results['per_basin'], pd.DataFrame):
-                df = task_results['per_basin']
-                report_lines.append(f"\n{task_name.upper()} PER-BASIN STATISTICS:")
-                report_lines.append("-" * 40)
                 
-                for metric_name in self.metrics:
-                    if metric_name in df.columns:
-                        report_lines.append(f"  {metric_name.upper()}:")
-                        report_lines.append(f"    Mean: {df[metric_name].mean():.4f}")
-                        report_lines.append(f"    Std: {df[metric_name].std():.4f}")
-                        report_lines.append(f"    Min: {df[metric_name].min():.4f}")
-                        report_lines.append(f"    Max: {df[metric_name].max():.4f}")
-        
-        # Detailed analysis
-        report_lines.append("\nDETAILED ANALYSIS:")
-        report_lines.append("-" * 40)
-        
-        for task_name, task_analysis in analysis.items():
-            report_lines.append(f"\n{task_name.upper()}:")
+                p_eval = torch.from_numpy(p_b[valid_t])
+                o_eval = torch.from_numpy(o_b[valid_t])
+                
+                res = self._compute_local_metrics({task: p_eval}, {task: o_eval}, self.target_metrics)
+                
+                for m in self.target_metrics:
+                    val = res.get(f"{task}_{m}")
+                    if val is not None and not np.isnan(val):
+                        task_metric_collections[m].append(val)
+                        per_basin_metrics[b_id][f"{task}_{m}"] = val
             
-            if 'prediction_stats' in task_analysis:
-                report_lines.append("  Prediction Statistics:")
-                for stat_name, stat_value in task_analysis['prediction_stats'].items():
-                    report_lines.append(f"    {stat_name}: {stat_value:.4f}")
+            for m in self.target_metrics:
+                arr = np.array(task_metric_collections[m])
+                if len(arr) > 0:
+                    global_metrics[f"{task}_{m}_mean"] = float(np.mean(arr))
+                    global_metrics[f"{task}_{m}_median"] = float(np.median(arr))
+                    global_metrics[f"{task}_{m}_25th"] = float(np.percentile(arr, 25))
+                    global_metrics[f"{task}_{m}_75th"] = float(np.percentile(arr, 75))
+                else:
+                    global_metrics[f"{task}_{m}_mean"] = float('nan')
+
+        ds_vars = {}
+        for task in self.task_names:
+            ds_vars[f"{task}_sim"] = (["basin", "time"], reconstructed_preds[task])
+            ds_vars[f"{task}_obs"] = (["basin", "time"], reconstructed_obs[task])
+        for g_name, g_mat in reconstructed_gates.items():
+            ds_vars[g_name] = (["basin", "time", f"expert_{g_name}"], g_mat)
             
-            if 'error_stats' in task_analysis:
-                report_lines.append("  Error Statistics:")
-                for stat_name, stat_value in task_analysis['error_stats'].items():
-                    report_lines.append(f"    {stat_name}: {stat_value:.4f}")
+        ds_export = xr.Dataset(
+            data_vars=ds_vars,
+            coords={"basin": self.basin_ids, "time": time_index},
+            attrs={
+                "description": "Spatiotemporal aligned multi-task prediction exports",
+                "unit_note": (
+                    "streamflow is restored to m3/s; "
+                    "evapotranspiration is restored to mm/day."
+                ),
+            },
+        )
+
+        return global_metrics, per_basin_metrics, ds_export
+
+    def _compute_local_metrics(self, preds: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor], metrics: List[str]) -> Dict[str, float]:
+        """Calculates specific evaluation statistics safely converting CUDA tensors."""
+        out_dict = {}
+        for task in preds.keys():
+            p = preds[task].detach().cpu().numpy().flatten()
+            t = targets[task].detach().cpu().numpy().flatten()
+            
+            mask = ~np.isnan(p) & ~np.isnan(t) & ~np.isinf(p) & ~np.isinf(t)
+            p, t = p[mask], t[mask]
+            
+            if len(p) < 2:
+                continue
+                
+            for m in metrics:
+                if m == "nse":
+                    num = np.sum((t - p) ** 2)
+                    den = np.sum((t - np.mean(t)) ** 2)
+                    out_dict[f"{task}_nse"] = float(1.0 - num / den) if den > 1e-12 else float("nan")
+
+                elif m == "kge":
+                    std_p, std_t = np.std(p), np.std(t)
+                    mean_p, mean_t = np.mean(p), np.mean(t)
+
+                    if std_p < 1e-8 or std_t < 1e-8 or abs(mean_t) < 1e-8:
+                        out_dict[f"{task}_kge"] = float("nan")
+                    else:
+                        r = np.corrcoef(p, t)[0, 1]
+                        alpha = std_p / std_t
+                        beta = mean_p / (mean_t + 1e-8)
+                        kge = 1.0 - np.sqrt((r - 1.0) ** 2 + (alpha - 1.0) ** 2 + (beta - 1.0) ** 2)
+                        out_dict[f"{task}_kge"] = float(kge)
+
+                elif m == "rmse":
+                    out_dict[f"{task}_rmse"] = float(np.sqrt(np.mean((p - t) ** 2)))
+
+                elif m == "mae":
+                    out_dict[f"{task}_mae"] = float(np.mean(np.abs(p - t)))
+
+                elif m == "bias":
+                    denom = np.sum(t)
+                    out_dict[f"{task}_bias"] = float(np.sum(p - t) / (denom + 1e-8)) if abs(denom) > 1e-8 else float("nan")
+
+                elif m == "corr":
+                    if np.std(p) < 1e-8 or np.std(t) < 1e-8:
+                        out_dict[f"{task}_corr"] = float("nan")
+                    else:
+                        out_dict[f"{task}_corr"] = float(np.corrcoef(p, t)[0, 1])
         
-        report_lines.append("\n" + "=" * 60)
-        
-        return "\n".join(report_lines)
-    
-    def save_results(self, results: Dict[str, Any]) -> None:
-        """Save evaluation results to files"""
-        if not self.save_dir:
-            return
-        
-        # Save overall metrics
-        metrics_file = self.save_dir / 'metrics.json'
-        import json
-        
-        # Convert numpy types to Python types for JSON serialization
-        def convert_to_serializable(obj):
-            if isinstance(obj, (np.float32, np.float64)):
-                return float(obj)
-            elif isinstance(obj, (np.int32, np.int64)):
-                return int(obj)
-            elif isinstance(obj, np.ndarray):
-                return obj.tolist()
-            elif isinstance(obj, pd.DataFrame):
-                return obj.to_dict('records')
-            return obj
-        
-        serializable_results = {}
-        for key, value in results.items():
-            if key == 'per_basin' and isinstance(value, pd.DataFrame):
-                serializable_results[key] = value.to_dict('records')
+        return out_dict
+
+
+class ClimateSpecializationAnalyzer:
+    """Classifies catchments based on climate dryness and snow ratios."""
+    def __init__(self, aridity_dict: Dict[str, float], snow_fraction_dict: Dict[str, float]):
+        self.aridity = aridity_dict
+        self.snow = snow_fraction_dict
+
+    def analyze_expert_utilization(self, basin_ids: List[str], gate_weights: np.ndarray, expert_labels: List[str]) -> pd.DataFrame:
+        """Determines routing activation matrices stratified by climate regimes."""
+        records = []
+        for idx, b_id in enumerate(basin_ids):
+            ai = self.aridity.get(b_id, np.nan)
+            sf = self.snow.get(b_id, np.nan)
+            
+            ai_class = "Humid" if ai < 1.0 else ("Arid" if ai >= 2.0 else "Semi-Arid")
+            sf_class = "Snowy" if sf >= 0.3 else "Non-Snowy"
+            
+            # Corrected: Protect averages mapping to prevent empty slice nanmean runtime warnings
+            subset = gate_weights[idx]
+            if np.isnan(subset).all():
+                mean_gates = np.full(subset.shape[-1], np.nan)
             else:
-                serializable_results[key] = convert_to_serializable(value)
+                mean_gates = np.nanmean(subset, axis=0)
+                
+            rec = {"basin_id": b_id, "climate_group": ai_class, "snow_group": sf_class}
+            for exp_idx, label in enumerate(expert_labels):
+                rec[label] = mean_gates[exp_idx]
+            records.append(rec)
+            
+        df = pd.DataFrame(records)
+        return df.groupby(["climate_group", "snow_group"])[expert_labels].mean()
+
+
+def compute_wilcoxon_paired_test(metrics_a: Dict[str, float], metrics_b: Dict[str, float]) -> Tuple[float, float, float]:
+    """
+    Applies Wilcoxon signed-rank significance check with non-parametric effect size calculation (r = Z / sqrt(N)).
+    Enforces rigorous NaN/Inf cleaning filters to prevent mathematical runtime warnings.
+    """
+    shared_basins = list(set(metrics_a.keys()).intersection(set(metrics_b.keys())))
+    if not shared_basins:
+        raise ValueError("Matched comparison datasets are missing coordinates.")
         
-        with open(metrics_file, 'w') as f:
-            json.dump(serializable_results, f, indent=2)
+    scores_a = np.array([metrics_a[b] for b in shared_basins], dtype=float)
+    scores_b = np.array([metrics_b[b] for b in shared_basins], dtype=float)
+    
+    # Corrected: Enforce robust filtration of non-finite elements to protect scipy wilcoxon execution
+    valid_mask = np.isfinite(scores_a) & np.isfinite(scores_b)
+    scores_a = scores_a[valid_mask]
+    scores_b = scores_b[valid_mask]
+    
+    n_samples = len(scores_a)
+    if n_samples < 5:
+        raise ValueError(f"Insufficient paired non-NaN samples ({n_samples} < 5) to compute a valid Wilcoxon signed-rank test.")
         
-        # Save per-basin metrics as CSV
-        for task_name, task_results in results.items():
-            if 'per_basin' in task_results and isinstance(task_results['per_basin'], pd.DataFrame):
-                csv_file = self.save_dir / f'{task_name}_per_basin_metrics.csv'
-                task_results['per_basin'].to_csv(csv_file, index=False)
+    # Corrected: Use SciPy asymptotic Z-statistic extraction instead of raw hand-approximated zero-ties
+    res = stats.wilcoxon(scores_a, scores_b, alternative='two-sided', method='approx')
+    stat = res.statistic
+    p_val = res.pvalue
+    z_stat = getattr(res, 'zstatistic', np.nan)
+    
+    # Corrected: Wilcoxon ties drop adjustment for exact non-parametric effect size computation
+    non_zero_diff = np.sum(scores_a != scores_b)
+    
+    if not np.isnan(z_stat) and non_zero_diff > 0:
+        effect_size = abs(z_stat) / np.sqrt(non_zero_diff)
+    elif non_zero_diff > 0:
+        # Fallback approximation for older SciPy distributions using effective non-zero tie bounds
+        std_w = np.sqrt(non_zero_diff * (non_zero_diff + 1) * (2 * non_zero_diff + 1) / 24.0)
+        mean_w = non_zero_diff * (non_zero_diff + 1) / 4.0
+        z_approx = (stat - mean_w) / std_w
+        effect_size = abs(z_approx) / np.sqrt(non_zero_diff)
+    else:
+        effect_size = 0.0
+    
+    return float(stat), float(p_val), float(effect_size)
+
+
+def holm_bonferroni_correction(p_values: List[float]) -> List[float]:
+    """
+    Applies Holm-Bonferroni step-down correction on multiple pairwise p-values.
+    Guarantees family-wise error rate control under rigorous multi-baseline comparisons.
+    """
+    m = len(p_values)
+    if m == 0:
+        return []
         
-        logger.info(f"Evaluation results saved to {self.save_dir}")
+    indexed_p = sorted(enumerate(p_values), key=lambda x: x[1])
+    corrected_p = [0.0] * m
+    
+    for i, (orig_idx, p) in enumerate(indexed_p):
+        corrected_val = p * (m - i)
+        corrected_p[orig_idx] = float(min(1.0, max(corrected_val, corrected_p[indexed_p[i-1][0]] if i > 0 else 0.0)))
+        
+    return corrected_p

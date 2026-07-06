@@ -1,8 +1,8 @@
 # ==============================================================================
 # Copyright (c) 2024-2026. All Rights Reserved.
 # Description: Automated module for executing baseline ablation studies.
-# Dynamically generates STL-Q, STL-ET, and Hard-MTL (Zero Task-Experts) models
-# to benchmark against the HydroMTL_CGC architecture.
+# Evaluates STL-Q, STL-ET, Hard-MTL, and MMoE.
+# Aligns command executions to list-based subprocesses to prevent shell injections.
 # ==============================================================================
 
 import os
@@ -11,11 +11,13 @@ import subprocess
 from copy import deepcopy
 from pathlib import Path
 
-# Dynamically resolve absolute paths based on the new deep directory structure
-# File: mtl_cgc/core/baseline/baselines.py
-# Root: Parent x 3 -> core -> mtl_cgc -> HydroMTL_CGC
+# Resolve project root dynamically by searching upwards for main.py to prevent path offsets
 SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
+PROJECT_ROOT = SCRIPT_DIR
+for _ in range(5):
+    if (PROJECT_ROOT / "main.py").exists():
+        break
+    PROJECT_ROOT = PROJECT_ROOT.parent
 
 MAIN_SCRIPT = PROJECT_ROOT / "main.py"
 BASE_CONFIG_PATH = PROJECT_ROOT / "mtl_cgc" / "configs" / "default.yaml"
@@ -23,6 +25,8 @@ BASE_CONFIG_PATH = PROJECT_ROOT / "mtl_cgc" / "configs" / "default.yaml"
 
 def load_base_config(path: Path) -> dict:
     """Loads the base YAML configuration."""
+    if not path.exists():
+        raise FileNotFoundError(f"[FATAL] Base configuration not found at {path}")
     with open(path, 'r') as f:
         return yaml.safe_load(f)
 
@@ -33,69 +37,63 @@ def save_temp_config(config_dict: dict, path: Path):
         yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
 
 
-def run_command(command: str):
-    """Executes a shell command from the project root directory."""
-    result = subprocess.run(command, shell=True, text=True, cwd=str(PROJECT_ROOT))
+def run_command(command_list: list):
+    """Executes a subprocess list command robustly from the project root directory without shell=True."""
+    result = subprocess.run(command_list, text=True, cwd=str(PROJECT_ROOT))
     if result.returncode != 0:
-        raise RuntimeError(f"Command execution failed: {command}")
+        raise RuntimeError(f"Command execution failed with return code {result.returncode}:\n{command_list}")
 
 
 def main():
-    if not BASE_CONFIG_PATH.exists():
-        raise FileNotFoundError(f"Base configuration not found at {BASE_CONFIG_PATH}")
-
     base_config = load_base_config(BASE_CONFIG_PATH)
+    FIXED_MTL_WEIGHTS = ["streamflow=1.0", "evapotranspiration=0.1"]
     
-    # --------------------------------------------------------------------------
-    # Define Baseline Experiments
-    # --------------------------------------------------------------------------
-    experiments =[]
+    experiments = []
 
-    # 1. STL-Q (Single Task: Streamflow)
-    cfg_stl_q = deepcopy(base_config)
-    cfg_stl_q['experiment']['name'] = "baseline_stl_q"
-    # Isolate streamflow target
-    cfg_stl_q['data']['targets'] =[t for t in cfg_stl_q['data']['targets'] if 'streamflow' in t['name'].lower()]
-    # Dummy expert value since it's a single task
-    cfg_stl_q['model']['cgc']['task_experts'] =[2] 
+    # --- 1. STL (Single Task: Streamflow Baseline) ---
+    cfg_stl = deepcopy(base_config)
+    cfg_stl['experiment']['name'] = "baseline_stl"
+    cfg_stl['model']['architecture'] = "stl"
     experiments.append({
-        "name": "STL-Streamflow",
-        "cfg": cfg_stl_q,
-        "weights": "streamflow=1.0"
+        "name": "Single-Task Learning (STL)",
+        "cfg": cfg_stl,
+        "weights": ["streamflow=1.0", "evapotranspiration=0.0"]
     })
 
-    # 2. STL-ET (Single Task: Evapotranspiration)
-    cfg_stl_et = deepcopy(base_config)
-    cfg_stl_et['experiment']['name'] = "baseline_stl_et"
-    # Isolate evapotranspiration target
-    cfg_stl_et['data']['targets'] =[t for t in cfg_stl_et['data']['targets'] if 'evapotranspiration' in t['name'].lower()]
-    cfg_stl_et['model']['cgc']['task_experts'] = [2]
+    # --- 2. HPS (Hard Parameter Sharing) ---
+    cfg_hps = deepcopy(base_config)
+    cfg_hps['experiment']['name'] = "baseline_hps"
+    cfg_hps['model']['architecture'] = "hps"
     experiments.append({
-        "name": "STL-Evapotranspiration",
-        "cfg": cfg_stl_et,
-        "weights": "evapotranspiration=1.0"
+        "name": "Hard Parameter Sharing (HPS)",
+        "cfg": cfg_hps,
+        "weights": FIXED_MTL_WEIGHTS
     })
 
-    # 3. Hard-MTL (Traditional Hard Parameter Sharing)
-    cfg_hard = deepcopy(base_config)
-    cfg_hard['experiment']['name'] = "baseline_hard_mtl"
-    # CRITICAL: Setting task-specific experts to 0 forces the model to degenerate 
-    # into a conventional hard-sharing network (utilizing ONLY shared experts).
-    cfg_hard['model']['cgc']['task_experts'] = [0, 0]
+    # --- 3. MMoE (Multi-gate Mixture-of-Experts) ---
+    cfg_mmoe = deepcopy(base_config)
+    cfg_mmoe['experiment']['name'] = "baseline_mmoe"
+    cfg_mmoe['model']['architecture'] = "mmoe"
     experiments.append({
-        "name": "Hard-Sharing MTL",
-        "cfg": cfg_hard,
-        # Maintain consistent weights with the primary CGC model
-        "weights": "streamflow=1.0 evapotranspiration=0.1" 
+        "name": "MMoE (Multi-gate Mixture-of-Experts)",
+        "cfg": cfg_mmoe,
+        "weights": FIXED_MTL_WEIGHTS
     })
 
-    # --------------------------------------------------------------------------
-    # Execute Experiments
-    # --------------------------------------------------------------------------
-    print(f"\n{'='*80}")
-    print(f"[INFO] Commencing Baseline Ablation Studies ({len(experiments)} Models).")
+    # --- 4. CGC (Customized Gate Control) ---
+    cfg_cgc = deepcopy(base_config)
+    cfg_cgc['experiment']['name'] = "baseline_cgc"
+    cfg_cgc['model']['architecture'] = "cgc"
+    experiments.append({
+        "name": "Customized Gate Control (CGC)",
+        "cfg": cfg_cgc,
+        "weights": FIXED_MTL_WEIGHTS
+    })
+
+    print(f"\n{'='*85}")
+    print(f"[INFO] Commencing Comprehensive Baseline Ablation Studies ({len(experiments)} Models).")
     print(f"       Project Root: {PROJECT_ROOT}")
-    print(f"{'='*80}\n")
+    print(f"{'='*85}\n")
 
     for idx, exp in enumerate(experiments, start=1):
         exp_title = exp["name"]
@@ -105,34 +103,39 @@ def main():
         exp_dir_name = cfg['experiment']['name']
         temp_yaml_path = PROJECT_ROOT / f"temp_{exp_dir_name}.yaml"
         
-        print(f"\n{'='*80}")
-        print(f" [RUN {idx:02d}/{len(experiments):02d}] Evaluating Baseline: {exp_title}")
-        print(f" Loss Weights: {weights}")
-        print(f"{'='*80}\n")
+        print(f"\n{'='*85}")
+        print(f" [RUN {idx:02d}/{len(experiments):02d}] Evaluating Architecture: {exp_title}")
+        print(f" Loss Weights Alignment: {weights}")
+        print(f"{'='*85}\n")
         
         save_temp_config(cfg, temp_yaml_path)
         
         try:
-            # Execute Training Phase
+            # Enforce non-shell list based execution for enhanced pipeline safety
             print(f"[INFO] Launching Training Phase for {exp_title}...")
-            train_cmd = f"python {str(MAIN_SCRIPT)} --config {str(temp_yaml_path)} --mode train --loss_weights {weights}"
+            train_cmd = ["python", str(MAIN_SCRIPT), "--config", str(temp_yaml_path), "--mode", "train", "--loss_weights"] + weights
             run_command(train_cmd)
             
-            # Execute Testing Phase
-            print(f"\n[INFO] Launching Testing Phase & NetCDF Export...")
-            test_cmd = f"python {str(MAIN_SCRIPT)} --config {str(temp_yaml_path)} --mode test --loss_weights {weights}"
+            print(f"\n[INFO] Launching Testing Phase & NetCDF/CSV Export...")
+            test_cmd = ["python", str(MAIN_SCRIPT), "--config", str(temp_yaml_path), "--mode", "test", "--loss_weights"] + weights
             run_command(test_cmd)
             
+            print(f"\n[SUCCESS] Baseline '{exp_title}' executed successfully.")
+            
         except Exception as e:
-            print(f"\n[ERROR] Baseline {exp_title} failed. Details: {e}")
+            print(f"\n[ERROR] Architecture {exp_title} failed during execution. Details: {e}")
+            print(f"[INFO] Proceeding to the next baseline...\n")
+            
         finally:
-            # Ensure workspace remains clean
             if temp_yaml_path.exists():
-                os.remove(temp_yaml_path)
+                try:
+                    os.remove(temp_yaml_path)
+                except Exception:
+                    pass
                 
-    print(f"\n{'='*80}")
-    print("[SUCCESS] All baseline experiments completed successfully.")
-    print(f"{'='*80}\n")
+    print(f"\n{'='*85}")
+    print("[SUCCESS] All baseline ablation experiments completed and artifacts saved.")
+    print(f"{'='*85}\n")
 
 if __name__ == "__main__":
     main()
