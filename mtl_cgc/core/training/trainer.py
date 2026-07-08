@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import sys
+import warnings
 from tqdm import tqdm
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
@@ -131,7 +132,7 @@ class HydroTrainer:
         if sched_type in {"reduce_on_plateau", "reducelronplateau"}:
             return optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer,
-                mode="min",
+                mode=str(sched_cfg.get("mode", "min")).lower(),
                 factor=float(sched_cfg.get("factor", 0.5)),
                 patience=int(sched_cfg.get("patience", 5)),
                 min_lr=float(sched_cfg.get("min_lr", 1e-6)),
@@ -156,39 +157,61 @@ class HydroTrainer:
     # --------------------------------------------------------------------------
     # Diagnostics
     # --------------------------------------------------------------------------
+    def _gradient_parameter_groups(self) -> Dict[str, List[torch.nn.Parameter]]:
+        """Return shared parameter groups for cross-task gradient diagnostics.
+
+        Only parameters that can receive gradients from both tasks should be
+        interpreted as task-conflict parameters. Task-specific towers and private
+        experts are intentionally excluded.
+        """
+        named_params = list(self.model.named_parameters())
+
+        input_encoder = [
+            p
+            for name, p in named_params
+            if "shared_encoder" in name and p.requires_grad
+        ]
+
+        shared_experts = [
+            p
+            for name, p in named_params
+            if "cgc_layer.shared_experts" in name and p.requires_grad
+        ]
+
+        # Fallbacks for non-CGC architectures. These names are deliberately
+        # conservative to avoid mixing task-private parameters into shared groups.
+        if not input_encoder:
+            input_encoder = [
+                p
+                for name, p in named_params
+                if ("encoder" in name.lower() and "task" not in name.lower())
+                and p.requires_grad
+            ]
+
+        groups: Dict[str, List[torch.nn.Parameter]] = {}
+        if input_encoder:
+            groups["input_encoder"] = input_encoder
+        if shared_experts:
+            groups["shared_experts"] = shared_experts
+
+        return groups
+
     def compute_gradient_similarity(
         self,
         loss_q: torch.Tensor,
         loss_et: torch.Tensor,
     ) -> Dict[str, float]:
-        """Compute task-gradient cosine similarity for selected parameter groups."""
-        param_groups = {
-            "Encoder": [
-                p
-                for name, p in self.model.named_parameters()
-                if (
-                    "shared_encoder" in name
-                    or "encoder" in name
-                    or "lstm" in name
-                )
-                and p.requires_grad
-            ],
-            "CGCBlock": [
-                p
-                for name, p in self.model.named_parameters()
-                if "cgc_layer" in name and p.requires_grad
-            ],
-            "Gate": [
-                p
-                for name, p in self.model.named_parameters()
-                if "gate" in name.lower() and p.requires_grad
-            ],
-        }
+        """Compute cross-task gradient diagnostics for shared parameters.
 
-        similarities: Dict[str, float] = {}
+        The returned metrics include cosine similarity, gradient norms, norm
+        ratio, and a binary conflict indicator for each parameter group. Empty
+        paired gradients are reported as NaN rather than zero because zero would
+        imply orthogonality instead of non-comparability.
+        """
+        diagnostics: Dict[str, float] = {}
+        eps = 1e-12
 
-
-        for group_name, params in param_groups.items():
+        for group_name, params in self._gradient_parameter_groups().items():
             if not params:
                 continue
 
@@ -207,25 +230,50 @@ class HydroTrainer:
                 create_graph=False,
             )
 
-            flat_q = []
-            flat_et = []
+            flat_q: List[torch.Tensor] = []
+            flat_et: List[torch.Tensor] = []
 
             for grad_q, grad_et in zip(grads_q, grads_et):
                 if grad_q is not None and grad_et is not None:
-                    flat_q.append(grad_q.detach().flatten())
-                    flat_et.append(grad_et.detach().flatten())
+                    flat_q.append(grad_q.detach().reshape(-1))
+                    flat_et.append(grad_et.detach().reshape(-1))
 
-            if flat_q and flat_et:
-                vec_q = torch.cat(flat_q)
-                vec_et = torch.cat(flat_et)
-                sim = F.cosine_similarity(vec_q, vec_et, dim=0)
-                similarities[group_name] = float(sim.item())
-            else:
-                similarities[group_name] = 0.0
+            prefix = f"grad_{group_name}"
 
-            del grads_q, grads_et, flat_q, flat_et
+            if not flat_q or not flat_et:
+                diagnostics[f"{prefix}_cosine"] = float("nan")
+                diagnostics[f"{prefix}_q_norm"] = float("nan")
+                diagnostics[f"{prefix}_et_norm"] = float("nan")
+                diagnostics[f"{prefix}_norm_ratio_q_to_et"] = float("nan")
+                diagnostics[f"{prefix}_conflict"] = float("nan")
+                diagnostics[f"{prefix}_num_tensors"] = 0.0
+                continue
 
-        return similarities
+            vec_q = torch.cat(flat_q)
+            vec_et = torch.cat(flat_et)
+
+            dot_value = torch.dot(vec_q, vec_et)
+            q_norm = torch.linalg.vector_norm(vec_q)
+            et_norm = torch.linalg.vector_norm(vec_et)
+            cosine = dot_value / (q_norm * et_norm + eps)
+
+            diagnostics[f"{prefix}_cosine"] = float(cosine.detach().cpu().item())
+            diagnostics[f"{prefix}_q_norm"] = float(q_norm.detach().cpu().item())
+            diagnostics[f"{prefix}_et_norm"] = float(et_norm.detach().cpu().item())
+            diagnostics[f"{prefix}_norm_ratio_q_to_et"] = float(
+                (q_norm / (et_norm + eps)).detach().cpu().item()
+            )
+            diagnostics[f"{prefix}_conflict"] = float(dot_value.detach().cpu().item() < 0.0)
+            diagnostics[f"{prefix}_num_tensors"] = float(len(flat_q))
+
+        # Backward-compatible aliases for old result aggregators. New analyses
+        # should use grad_input_encoder_cosine and grad_shared_experts_cosine.
+        if "grad_input_encoder_cosine" in diagnostics:
+            diagnostics["Encoder"] = diagnostics["grad_input_encoder_cosine"]
+        if "grad_shared_experts_cosine" in diagnostics:
+            diagnostics["Shared_Experts"] = diagnostics["grad_shared_experts_cosine"]
+
+        return diagnostics
 
     @staticmethod
     def summarize_gate_tensor(gate_array: np.ndarray) -> Dict[str, Any]:
@@ -267,7 +315,11 @@ class HydroTrainer:
             try:
                 gate_array = np.concatenate(gate_list, axis=0)
                 diagnostics[gate_name] = self.summarize_gate_tensor(gate_array)
-            except Exception:
+            except Exception as exc:
+                warnings.warn(
+                    f"Gate diagnostic failed for {gate_name}: {exc}",
+                    RuntimeWarning,
+                )
                 diagnostics[gate_name] = {
                     "entropy": np.nan,
                     "utilization": [],
@@ -339,9 +391,13 @@ class HydroTrainer:
 
                 total_loss = self.criterion(preds, targets, static_num)
 
+            diag_cfg = getattr(self.config.training, "diagnostics", {})
+            max_diag_batches = int(diag_cfg.get("gradient_batches_per_epoch", 5))
+            fail_on_error = bool(diag_cfg.get("fail_on_error", False))
+
             if (
                 log_gradients
-                and batch_idx % 50 == 0
+                and batch_idx <= max_diag_batches
                 and "streamflow" in losses
                 and "evapotranspiration" in losses
             ):
@@ -351,9 +407,17 @@ class HydroTrainer:
                         losses["evapotranspiration"],
                     )
                     for key, value in sim_dict.items():
-                        grad_sim_sums[key].append(value)
-                except Exception:
-                    pass
+                        if np.isfinite(value):
+                            grad_sim_sums[key].append(value)
+                except Exception as exc:
+                    if fail_on_error:
+                        raise
+                    warnings.warn(
+                        "Gradient diagnostic failed: "
+                        f"epoch={self.current_epoch}, batch={batch_idx}, error={exc}",
+                        RuntimeWarning,
+                    )
+                    grad_sim_sums["gradient_failures"].append(1.0)
 
             self.scaler.scale(total_loss).backward()
             self.scaler.unscale_(self.optimizer)

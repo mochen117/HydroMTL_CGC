@@ -162,11 +162,19 @@ training:
     water_balance_weight: 0.0
     eps: 1.0e-6
 
+  monitor:
+    # Shared validation monitor used by scheduler, checkpoint, and early stopping.
+    # Use joint_nse for balanced Q-ET model selection; use a task-specific NSE
+    # monitor for target-variable transfer experiments.
+    name: "joint_nse"
+    mode: "max"
+    min_delta: 1.0e-4
+
   scheduler:
     type: "reduce_on_plateau"
-    mode: "min"
+    mode: "max"
     factor: 0.5
-    patience: 5
+    patience: 8
     min_lr: 1.0e-6
 
   epochs: 300
@@ -174,8 +182,14 @@ training:
 
   early_stopping:
     enabled: true
-    patience: 20
+    patience: 40
     min_delta: 1.0e-4
+
+  diagnostics:
+    enabled: true
+    epoch_interval: 1
+    gradient_batches_per_epoch: 5
+    fail_on_error: false
 
   dropout: 0.1
   batch_norm: true

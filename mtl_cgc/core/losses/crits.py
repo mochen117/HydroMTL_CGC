@@ -64,7 +64,8 @@ class DynamicMultiTaskLoss(nn.Module):
             # Revert to physical domain with strict shape alignments
             q_log = preds_dict[self.q_name].reshape(-1) * q_std + q_mean
             q_log = torch.clamp(q_log, -5.0, 10.0)
-            q_phys = (torch.pow(10, q_log) - 0.1)**2
+            sqrt_q_phys = torch.clamp(torch.pow(10, q_log) - 0.1, min=0.0)
+            q_phys = sqrt_q_phys ** 2
             
             et_phys = preds_dict[self.et_name].reshape(-1) * et_std + et_mean
             p_phys = s_num[:, self.prcp_idx].reshape(-1)

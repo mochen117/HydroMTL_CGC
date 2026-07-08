@@ -125,7 +125,30 @@ class HydroEvaluator:
             },
         )
 
+        self._assign_variable_units(ds_export)
+
         return global_metrics, per_basin_metrics, ds_export
+
+    def _assign_variable_units(self, ds_export: xr.Dataset) -> None:
+        """Attach publication-ready physical units to exported variables."""
+        for task in self.task_names:
+            sim_name = f"{task}_sim"
+            obs_name = f"{task}_obs"
+
+            if "streamflow" in task:
+                units = "m3 s-1"
+                long_name = "streamflow"
+            elif "evapo" in task:
+                units = "mm day-1"
+                long_name = "evapotranspiration"
+            else:
+                units = "native units"
+                long_name = task
+
+            for var_name, suffix in [(sim_name, "simulation"), (obs_name, "observation")]:
+                if var_name in ds_export:
+                    ds_export[var_name].attrs["units"] = units
+                    ds_export[var_name].attrs["long_name"] = f"{long_name} {suffix}"
 
     def _compute_local_metrics(self, preds: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor], metrics: List[str]) -> Dict[str, float]:
         """Calculates specific evaluation statistics safely converting CUDA tensors."""
@@ -167,7 +190,14 @@ class HydroEvaluator:
 
                 elif m == "bias":
                     denom = np.sum(t)
-                    out_dict[f"{task}_bias"] = float(np.sum(p - t) / (denom + 1e-8)) if abs(denom) > 1e-8 else float("nan")
+                    relative_bias = (
+                        float(np.sum(p - t) / (denom + 1e-8))
+                        if abs(denom) > 1e-8
+                        else float("nan")
+                    )
+                    # Backward-compatible key retained; it represents relative bias.
+                    out_dict[f"{task}_bias"] = relative_bias
+                    out_dict[f"{task}_relative_bias"] = relative_bias
 
                 elif m == "corr":
                     if np.std(p) < 1e-8 or np.std(t) < 1e-8:

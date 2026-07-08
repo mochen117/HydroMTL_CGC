@@ -4,8 +4,8 @@
 #   Feature scaling module for HydroMTL_CGC.
 #   The streamflow scaling follows the DapengScaler convention:
 #       Q(cfs) -> Q(mm/day) / p_mean -> log10(sqrt(x) + 0.1) -> standardization.
-#   During evaluation, streamflow is restored to cfs for consistency with the
-#   original CAMELS target and hard-sharing benchmark.
+#   During evaluation, streamflow is restored to m3/s for consistency with
+#   Ouyang-style reporting and hydrological benchmark tables.
 # ==============================================================================
 
 from typing import Any, Dict, Optional, Tuple
@@ -45,6 +45,23 @@ class HydroScaler:
             (task for task in self.task_names if "streamflow" in task),
             "streamflow",
         )
+
+        if self.q_name in self.task_names:
+            self._validate_streamflow_scaling_features()
+
+
+    def _validate_streamflow_scaling_features(self) -> None:
+        """Ensure static attributes required by streamflow scaling are present."""
+        required = {
+            "area_gages2": self.area_idx,
+            "p_mean": self.prcp_idx,
+        }
+        missing = [name for name, index in required.items() if index < 0]
+        if missing:
+            raise ValueError(
+                "Streamflow scaling requires static features: "
+                + ", ".join(missing)
+            )
 
     def fit_transform(
         self,
@@ -122,8 +139,8 @@ class HydroScaler:
             task_std=task_std,
         )
 
-        area_raw = self._extract_basin_attribute(stat_num_raw, self.area_idx)
-        prcp_raw = self._extract_basin_attribute(stat_num_raw, self.prcp_idx)
+        area_raw = self._extract_basin_attribute(stat_num_raw, self.area_idx, "area_gages2")
+        prcp_raw = self._extract_basin_attribute(stat_num_raw, self.prcp_idx, "p_mean")
 
         area_raw = self._align_basin_vector(area_raw, latent_arr)
         prcp_raw = self._align_basin_vector(prcp_raw, latent_arr)
@@ -155,7 +172,7 @@ class HydroScaler:
             return latent_arr
 
         stat_num_raw = self._inverse_static_features(stat_num_scaled)
-        prcp_raw = self._extract_basin_attribute(stat_num_raw, self.prcp_idx)
+        prcp_raw = self._extract_basin_attribute(stat_num_raw, self.prcp_idx, "p_mean")
 
         task_mean = self.stat_dict.get(f"{self.q_name}_mean", 0.0)
         task_std = self.stat_dict.get(f"{self.q_name}_std", 1.0)
@@ -197,8 +214,11 @@ class HydroScaler:
         """Fit and transform target variables."""
         target_t: Dict[str, np.ndarray] = {}
 
-        area = self._extract_basin_attribute(s_num, self.area_idx)
-        prcp = self._extract_basin_attribute(s_num, self.prcp_idx)
+        area = None
+        prcp = None
+        if self.q_name in self.task_names:
+            area = self._extract_basin_attribute(s_num, self.area_idx, "area_gages2")
+            prcp = self._extract_basin_attribute(s_num, self.prcp_idx, "p_mean")
 
         for task in self.task_names:
             raw_y = y_dict[task]
@@ -232,8 +252,11 @@ class HydroScaler:
         """Transform target variables using fitted statistics."""
         target_t: Dict[str, np.ndarray] = {}
 
-        area = self._extract_basin_attribute(s_num, self.area_idx)
-        prcp = self._extract_basin_attribute(s_num, self.prcp_idx)
+        area = None
+        prcp = None
+        if self.q_name in self.task_names:
+            area = self._extract_basin_attribute(s_num, self.area_idx, "area_gages2")
+            prcp = self._extract_basin_attribute(s_num, self.prcp_idx, "p_mean")
 
         for task in self.task_names:
             raw_y = y_dict.get(task)
@@ -289,7 +312,11 @@ class HydroScaler:
         q_log = latent_arr * task_std + task_mean
         q_log = np.clip(q_log, -5.0, 10.0)
 
-        q_ratio = (np.power(10.0, q_log) - self.LOG_EPSILON) ** 2
+        sqrt_q_ratio = np.maximum(
+            np.power(10.0, q_log) - self.LOG_EPSILON,
+            0.0,
+        )
+        q_ratio = sqrt_q_ratio ** 2
         return np.maximum(q_ratio, 0.0)
 
     def _physical_basin_norm(
@@ -341,14 +368,25 @@ class HydroScaler:
         self,
         stat_matrix: np.ndarray,
         index: int,
+        feature_name: str,
     ) -> np.ndarray:
-        """Extract a positive basin attribute vector with safe fallbacks."""
-        if index != -1 and stat_matrix.shape[1] > index:
-            values = np.nan_to_num(stat_matrix[:, index], nan=1.0)
-        else:
-            values = np.ones(stat_matrix.shape[0])
+        """Extract a strictly positive basin attribute required by scaling."""
+        if index < 0 or stat_matrix.shape[1] <= index:
+            raise ValueError(f"Missing required basin attribute: {feature_name}")
 
-        return np.maximum(values, 1e-2)
+        values = np.asarray(stat_matrix[:, index], dtype=float)
+
+        if not np.all(np.isfinite(values)):
+            raise ValueError(
+                f"Non-finite values found in required basin attribute: {feature_name}"
+            )
+
+        if np.any(values <= 0.0):
+            raise ValueError(
+                f"Non-positive values found in required basin attribute: {feature_name}"
+            )
+
+        return values
 
     def _align_basin_vector(
         self,

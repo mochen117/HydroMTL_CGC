@@ -249,6 +249,105 @@ def format_metric(value: Any, width: int = 7, precision: int = 4) -> str:
         return f"{'nan':>{width}}"
 
 
+def to_plain_dict(obj: Any) -> Any:
+    """Convert nested EasyDict/list objects into JSON-serializable containers."""
+    if isinstance(obj, dict):
+        return {str(key): to_plain_dict(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [to_plain_dict(value) for value in obj]
+    if isinstance(obj, tuple):
+        return [to_plain_dict(value) for value in obj]
+    return obj
+
+
+def resolve_monitor_settings(config: Any, eval_cfg: Any) -> Tuple[str, str, float]:
+    """Resolve the validation monitor shared by scheduler, checkpoint, and early stop."""
+    monitor_cfg = config.training.get("monitor", {})
+    fallback_name = eval_cfg.get("primary_metric", "streamflow_nse_median")
+
+    monitor_name = str(monitor_cfg.get("name", fallback_name))
+    default_mode = "min" if monitor_name.lower() in {"loss", "val_loss"} else "max"
+    monitor_mode = str(monitor_cfg.get("mode", default_mode)).lower()
+    min_delta = float(monitor_cfg.get("min_delta", config.training.get("min_delta", 1e-4)))
+
+    if monitor_mode not in {"min", "max"}:
+        raise ValueError(f"Unsupported monitor mode: {monitor_mode}")
+
+    return monitor_name, monitor_mode, min_delta
+
+
+def compute_monitor_value(
+    monitor_name: str,
+    val_loss: float,
+    val_metrics: Dict[str, float],
+) -> float:
+    """Compute the scalar monitor used for all training-control decisions."""
+    name = monitor_name.lower()
+
+    if name in {"loss", "val_loss"}:
+        value = float(val_loss)
+    elif name == "joint_nse":
+        nse_values = [
+            float(value)
+            for key, value in val_metrics.items()
+            if key.endswith("_nse_median") and np.isfinite(float(value))
+        ]
+        if not nse_values:
+            raise ValueError("joint_nse requires at least one finite *_nse_median metric.")
+        value = float(np.mean(nse_values))
+    else:
+        value = float(val_metrics.get(monitor_name, np.nan))
+
+    if not np.isfinite(value):
+        raise ValueError(f"Invalid monitor value: {monitor_name}={value}")
+
+    return value
+
+
+def monitor_is_better(
+    value: float,
+    best_value: Optional[float],
+    mode: str,
+    min_delta: float,
+) -> bool:
+    """Return True when a monitor value improves on the current best value."""
+    if best_value is None:
+        return True
+    if mode == "min":
+        return value < best_value - min_delta
+    if mode == "max":
+        return value > best_value + min_delta
+    raise ValueError(f"Unsupported monitor mode: {mode}")
+
+
+def scheduler_step(scheduler: Optional[Any], monitor_value: float) -> None:
+    """Step either ReduceLROnPlateau or epoch-based schedulers safely."""
+    if scheduler is None:
+        return
+    if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+        scheduler.step(monitor_value)
+    else:
+        scheduler.step()
+
+
+def load_model_checkpoint(model: torch.nn.Module, checkpoint_path: Path, device: torch.device) -> Dict[str, Any]:
+    """Load old raw state_dict checkpoints and new full checkpoint payloads."""
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        model.load_state_dict(checkpoint["model_state_dict"])
+        return checkpoint
+
+    model.load_state_dict(checkpoint)
+    return {
+        "epoch": None,
+        "monitor_name": None,
+        "monitor_mode": None,
+        "monitor_value": None,
+        "model_state_dict": checkpoint,
+    }
+
+
 def export_experiment_metadata(
     save_dir: Path,
     config: Any,
@@ -578,20 +677,27 @@ def main() -> None:
         print(f"Batch Size            : {train_loader.batch_size}")
         print("=" * 112 + "\n")
 
+        monitor_name, monitor_mode, monitor_min_delta = resolve_monitor_settings(config, eval_cfg)
+        sched_cfg = getattr(config.training, "scheduler", {})
+        if sched_cfg and str(sched_cfg.get("type", "")).lower() in {"reduce_on_plateau", "reducelronplateau"}:
+            config.training.scheduler["mode"] = monitor_mode
+
         evaluator = HydroEvaluator(config, train_basins, global_scaler)
         trainer = HydroTrainer(model=model, config=config, device=device, evaluator=evaluator)
 
         total_params = sum(p.numel() for p in trainer.model.parameters() if p.requires_grad)
         print(f"Trainable parameters: {total_params:,}")
+        print(f"Monitor             : {monitor_name} ({monitor_mode})")
         print("Optimization started.")
         print("-" * 112)
 
         epochs = int(getattr(config.training, "epochs", 100))
-        best_val_loss = float("inf")
-        best_val_metric = -float("inf")
+        best_monitor_value: Optional[float] = None
         best_streamflow_nse = -float("inf")
         best_evapotranspiration_nse = -float("inf")
         best_epoch = 0
+        last_epoch = 0
+        last_monitor_value = float("nan")
 
         best_metrics: Dict[str, float] = {}
         best_per_basin_metrics: Dict[str, Dict[str, float]] = {}
@@ -600,20 +706,32 @@ def main() -> None:
 
         early_cfg = config.training.get("early_stopping", {})
         patience_val = int(early_cfg.get("patience", config.training.get("patience", 15)))
-        min_delta = float(early_cfg.get("min_delta", config.training.get("min_delta", 1e-4)))
+        early_min_delta = float(early_cfg.get("min_delta", monitor_min_delta))
 
-        early_stop = EarlyStopping(patience=patience_val, min_delta=min_delta, restore_best_weights=True)
-        ckpt = ModelCheckpoint(save_dir=str(save_dir), save_best_only=True, verbose=False)
+        early_stop = EarlyStopping(
+            patience=patience_val,
+            min_delta=early_min_delta,
+            mode=monitor_mode,
+            restore_best_weights=False,
+        )
+        ckpt = ModelCheckpoint(
+            save_dir=str(save_dir),
+            save_best_only=bool(config.training.get("save_best_only", True)),
+            verbose=False,
+        )
 
-        primary_metric = eval_cfg.get("primary_metric", "streamflow_nse_median")
-        use_loss_criterion = primary_metric.lower() == "loss"
+        diag_cfg = config.training.get("diagnostics", {})
+        diag_enabled = bool(diag_cfg.get("enabled", True))
+        diag_interval = int(diag_cfg.get("epoch_interval", getattr(config.training, "diagnostic_interval", 10)))
+        diag_interval = max(1, diag_interval)
 
         history_records: List[Dict[str, Any]] = []
 
         for epoch in range(1, epochs + 1):
             epoch_start = time.time()
+            last_epoch = epoch
             trainer.current_epoch = epoch
-            log_gradients = epoch == 1 or epoch % int(getattr(config.training, "diagnostic_interval", 10)) == 0
+            log_gradients = diag_enabled and (epoch == 1 or epoch % diag_interval == 0)
 
             train_loss, task_losses, grad_sims = trainer.train_epoch(train_loader, log_gradients=log_gradients)
             val_loss, val_metrics, val_per_basin_metrics, _, val_diags = trainer.validate(
@@ -633,28 +751,45 @@ def main() -> None:
             if is_valid_metric(current_evapotranspiration_nse):
                 best_evapotranspiration_nse = max(best_evapotranspiration_nse, float(current_evapotranspiration_nse))
 
-            if trainer.scheduler:
-                trainer.scheduler.step(val_loss)
+            monitor_value = compute_monitor_value(
+                monitor_name=monitor_name,
+                val_loss=val_loss,
+                val_metrics=val_metrics,
+            )
+            last_monitor_value = monitor_value
 
-            if use_loss_criterion:
-                is_best = val_loss < best_val_loss
-                if is_best:
-                    best_val_loss = val_loss
-                    best_metrics = dict(val_metrics)
-                    best_per_basin_metrics = dict(val_per_basin_metrics)
-                    best_epoch = epoch
-                ckpt.step(trainer.model, epoch, val_loss, is_best, trainer.optimizer)
-            else:
-                current_metric = val_metrics.get(primary_metric, -float("inf"))
-                is_best = current_metric > best_val_metric
-                if is_best:
-                    best_val_metric = current_metric
-                    best_metrics = dict(val_metrics)
-                    best_per_basin_metrics = dict(val_per_basin_metrics)
-                    best_epoch = epoch
-                ckpt.step(trainer.model, epoch, -current_metric, is_best, trainer.optimizer)
+            is_best = monitor_is_better(
+                value=monitor_value,
+                best_value=best_monitor_value,
+                mode=monitor_mode,
+                min_delta=monitor_min_delta,
+            )
 
-            early_stop.step(val_loss, trainer.model)
+            if is_best:
+                best_monitor_value = monitor_value
+                best_metrics = dict(val_metrics)
+                best_per_basin_metrics = dict(val_per_basin_metrics)
+                best_epoch = epoch
+
+            scheduler_step(trainer.scheduler, monitor_value)
+
+            ckpt.step(
+                model=trainer.model,
+                epoch=epoch,
+                monitor_value=monitor_value,
+                is_best=is_best,
+                optimizer=trainer.optimizer,
+                scheduler=trainer.scheduler,
+                monitor_name=monitor_name,
+                monitor_mode=monitor_mode,
+                extra={
+                    "val_loss": float(val_loss),
+                    "train_loss": float(train_loss),
+                    "config": to_plain_dict(config),
+                },
+            )
+
+            early_stop.step(monitor_value)
 
             lr = trainer.optimizer.param_groups[0]["lr"]
             elapsed = time.time() - epoch_start
@@ -677,11 +812,16 @@ def main() -> None:
                 "train_loss": train_loss,
                 "val_loss": val_loss,
                 "learning_rate": lr,
+                "monitor_name": monitor_name,
+                "monitor_mode": monitor_mode,
+                "monitor_value": monitor_value,
+                "best_monitor_value": best_monitor_value,
                 "is_best": is_best,
                 "best_epoch": best_epoch,
                 "encoder_grad_sim": grad_sims.get("Encoder", np.nan) if grad_sims else np.nan,
             }
             history_row.update({f"task_loss_{k}": v for k, v in task_losses.items()})
+            history_row.update(grad_sims)
             history_row.update(val_metrics)
             history_records.append(history_row)
 
@@ -697,11 +837,60 @@ def main() -> None:
         print("-" * 112)
         print(f"Best epoch: {best_epoch:03d}")
 
-        final_metrics = best_metrics if best_metrics else last_val_metrics
+        ckpt.save_last(
+            model=trainer.model,
+            epoch=last_epoch,
+            monitor_value=last_monitor_value,
+            optimizer=trainer.optimizer,
+            scheduler=trainer.scheduler,
+            monitor_name=monitor_name,
+            monitor_mode=monitor_mode,
+            filename="last_model.pth",
+            extra={"config": to_plain_dict(config)},
+        )
+        ckpt.save_last(
+            model=trainer.model,
+            epoch=last_epoch,
+            monitor_value=last_monitor_value,
+            optimizer=trainer.optimizer,
+            scheduler=trainer.scheduler,
+            monitor_name=monitor_name,
+            monitor_mode=monitor_mode,
+            filename="final_model.pth",
+            extra={"config": to_plain_dict(config)},
+        )
+
+        best_path = save_dir / "best_model.pth"
+        if best_path.exists():
+            load_model_checkpoint(trainer.model, best_path, device)
+            _, best_metrics, best_per_basin_metrics, _, _ = trainer.validate(
+                val_loader,
+                period_dates=config.data.val_period,
+            )
+
+        final_metrics = dict(best_metrics if best_metrics else last_val_metrics)
         final_per_basin_metrics = best_per_basin_metrics if best_per_basin_metrics else last_val_per_basin_metrics
 
-        encoder_sims = [h.get("Encoder", 0.0) for h in trainer.gradient_history if h and "Encoder" in h]
-        final_metrics["encoder_grad_sim"] = float(np.mean(encoder_sims)) if encoder_sims else np.nan
+        input_encoder_sims = [
+            h.get("grad_input_encoder_cosine", np.nan)
+            for h in trainer.gradient_history
+            if h and "grad_input_encoder_cosine" in h
+        ]
+        shared_expert_sims = [
+            h.get("grad_shared_experts_cosine", np.nan)
+            for h in trainer.gradient_history
+            if h and "grad_shared_experts_cosine" in h
+        ]
+
+        final_metrics["monitor_name"] = monitor_name
+        final_metrics["monitor_mode"] = monitor_mode
+        final_metrics["best_monitor_value"] = float(best_monitor_value) if best_monitor_value is not None else np.nan
+        final_metrics["best_epoch"] = int(best_epoch)
+        final_metrics["encoder_grad_sim"] = float(np.nanmean(input_encoder_sims)) if input_encoder_sims else np.nan
+        final_metrics["grad_input_encoder_cosine"] = final_metrics["encoder_grad_sim"]
+        final_metrics["grad_shared_experts_cosine"] = (
+            float(np.nanmean(shared_expert_sims)) if shared_expert_sims else np.nan
+        )
 
         pd.DataFrame(history_records).to_csv(save_dir / "training_history.csv", index=False)
         pd.DataFrame([final_metrics]).to_csv(save_dir / "validation_summary.csv", index=False)
@@ -710,8 +899,6 @@ def main() -> None:
             per_basin_df = pd.DataFrame.from_dict(final_per_basin_metrics, orient="index")
             per_basin_df.index.name = "gauge_id"
             per_basin_df.reset_index().to_csv(save_dir / "validation_per_basin_metrics.csv", index=False)
-
-        torch.save(trainer.model.state_dict(), save_dir / "final_model.pth")
 
         print_final_metrics("Final validation metrics", final_metrics)
         print(f"Model training completed. Artifacts saved to: {save_dir}")
@@ -736,7 +923,14 @@ def main() -> None:
             print(f"[FATAL] No trained model found in {save_dir}. Run training first.")
             sys.exit(1)
 
-        model.load_state_dict(torch.load(best_model, map_location=device))
+        checkpoint_info = load_model_checkpoint(model, best_model, device)
+        if checkpoint_info.get("monitor_name"):
+            print(
+                "Loaded checkpoint: "
+                f"epoch={checkpoint_info.get('epoch')}, "
+                f"{checkpoint_info.get('monitor_name')}={checkpoint_info.get('monitor_value')}",
+                flush=True,
+            )
         evaluator = HydroEvaluator(config, test_basins, global_scaler)
         trainer = HydroTrainer(model=model, config=config, device=device, evaluator=evaluator)
 
