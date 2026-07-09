@@ -217,7 +217,7 @@ def _loader_kwargs(
     pin_memory = bool(data_cfg.get("pin_memory", False))
 
     kwargs = {
-        "batch_size": int(data_cfg.get("batch_size", 100)),
+        "batch_size": int(data_cfg.get("batch_size", 64)),
         "shuffle": shuffle,
         "drop_last": drop_last,
         "num_workers": num_workers,
