@@ -161,19 +161,121 @@ def parse_loss_weights(raw_items: Optional[List[str]]) -> Tuple[Dict[str, float]
     return weight_dict, messages
 
 
+def get_target_name(target: Any) -> str:
+    """
+    Return a lowercase target name from either a mapping-like target,
+    an object with a `.name` attribute, or a plain string.
+    """
+    if isinstance(target, dict):
+        value = target.get("name", target)
+    else:
+        value = getattr(target, "name", target)
+    return str(value).strip().lower()
+
+
+def period_is_missing(period: Any) -> bool:
+    """Return True when a temporal period is absent."""
+    if period is None:
+        return True
+    if isinstance(period, str) and period.strip().lower() in {"", "none", "null"}:
+        return True
+    if isinstance(period, (list, tuple)) and len(period) == 0:
+        return True
+    return False
+
+
+def period_to_list(period: Any) -> Optional[List[str]]:
+    """Convert a temporal period to a printable list."""
+    if period_is_missing(period):
+        return None
+    return list(period)
+
+
+def first_available_period(config_data: Any, *names: str) -> Any:
+    """Return the first non-empty period from config.data."""
+    for name in names:
+        value = getattr(config_data, name, None)
+        if not period_is_missing(value):
+            return value
+    return None
+
+
 def validate_temporal_splits(config: Any) -> None:
-    """Fail fast when train/validation/test periods overlap."""
-    train_start, train_end = map(pd.to_datetime, config.data.train_period)
-    val_start, val_end = map(pd.to_datetime, config.data.val_period)
-    test_start, test_end = map(pd.to_datetime, config.data.test_period)
+    """
+    Validate temporal splits.
+
+    The validation period is optional. If validation is absent, the required
+    order is:
+
+        train_start <= train_end < test_start <= test_end
+
+    If validation is present, the required order is:
+
+        train_start <= train_end < val_start <= val_end < test_start <= test_end
+    """
+
+    def is_missing_period(period: Any) -> bool:
+        if period is None:
+            return True
+        if isinstance(period, str) and period.lower() in {"", "none", "null"}:
+            return True
+        if isinstance(period, (list, tuple)) and len(period) == 0:
+            return True
+        return False
+
+    def parse_period(period: Any, name: str):
+        if is_missing_period(period):
+            return None
+        if not isinstance(period, (list, tuple)) or len(period) != 2:
+            raise ValueError(f"{name} must be a two-element list, got: {period}")
+        start, end = map(pd.to_datetime, period)
+        return start, end
+
+    train = parse_period(getattr(config.data, "train_period", None), "train_period")
+    test = parse_period(getattr(config.data, "test_period", None), "test_period")
+
+    validation_candidates = [
+        getattr(config.data, "val_period", None),
+        getattr(config.data, "valid_period", None),
+        getattr(config.data, "validation_period", None),
+    ]
+
+    valid = None
+    for candidate in validation_candidates:
+        if not is_missing_period(candidate):
+            valid = parse_period(candidate, "valid_period")
+            break
+
+    if train is None or test is None:
+        raise ValueError("Both train_period and test_period are required.")
+
+    train_start, train_end = train
+    test_start, test_end = test
+
+    if train_start > train_end:
+        raise ValueError("Invalid train_period: train_start must be <= train_end.")
+
+    if test_start > test_end:
+        raise ValueError("Invalid test_period: test_start must be <= test_end.")
+
+    if valid is None:
+        if not (train_end < test_start):
+            raise ValueError(
+                "Invalid temporal split. Expected: "
+                "train_start <= train_end < test_start <= test_end."
+            )
+        return
+
+    val_start, val_end = valid
+
+    if val_start > val_end:
+        raise ValueError("Invalid valid_period: val_start must be <= val_end.")
 
     if not (train_start <= train_end < val_start <= val_end < test_start <= test_end):
         raise ValueError(
             "Invalid temporal split. Expected: "
             "train_start <= train_end < val_start <= val_end < test_start <= test_end."
         )
-
-
 def discover_basin_ids(data_root: Path) -> List[str]:
     """Discover basin identifiers from gage_*.nc files."""
     basin_ids = sorted([f.stem.replace("gage_", "") for f in data_root.glob("gage_*.nc")])
@@ -330,9 +432,291 @@ def scheduler_step(scheduler: Optional[Any], monitor_value: float) -> None:
         scheduler.step()
 
 
+def load_torch_checkpoint(
+    checkpoint_path: Path,
+    device: torch.device | str,
+) -> Any:
+    """Load a trusted local checkpoint across PyTorch versions."""
+    try:
+        return torch.load(
+            checkpoint_path,
+            map_location=device,
+            weights_only=False,
+        )
+    except TypeError:
+        return torch.load(
+            checkpoint_path,
+            map_location=device,
+        )
+
+
+def move_optimizer_state_to_device(
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> None:
+    """Move all tensor-valued optimizer state to the active device."""
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
+
+
+def restore_rng_state(rng_state: Optional[Dict[str, Any]]) -> None:
+    """Restore Python, NumPy, CPU, and CUDA random-number states."""
+    if not rng_state:
+        warnings.warn(
+            "Resume checkpoint has no RNG state; continuation remains valid "
+            "but will not be bitwise reproducible.",
+            RuntimeWarning,
+        )
+        return
+
+    python_state = rng_state.get("python")
+    if python_state is not None:
+        random.setstate(python_state)
+
+    numpy_state = rng_state.get("numpy")
+    if isinstance(numpy_state, dict):
+        np.random.set_state(
+            (
+                str(numpy_state["bit_generator"]),
+                np.asarray(
+                    numpy_state["state"],
+                    dtype=np.uint32,
+                ),
+                int(numpy_state["position"]),
+                int(numpy_state["has_gauss"]),
+                float(numpy_state["cached_gaussian"]),
+            )
+        )
+
+    torch_cpu_state = rng_state.get("torch_cpu")
+    if torch_cpu_state is not None:
+        torch.set_rng_state(torch_cpu_state.cpu())
+
+    torch_cuda_state = rng_state.get("torch_cuda")
+    if torch.cuda.is_available() and torch_cuda_state is not None:
+        torch.cuda.set_rng_state_all(
+            [state.cpu() for state in torch_cuda_state]
+        )
+
+
+def _target_names_from_config(config_like: Any) -> List[str]:
+    """Extract normalized target names from a config dictionary."""
+    plain = to_plain_dict(config_like)
+    targets = plain.get("data", {}).get("targets", [])
+    names: List[str] = []
+
+    for target in targets:
+        if isinstance(target, dict):
+            names.append(str(target.get("name", "")).lower())
+        else:
+            names.append(str(target).lower())
+
+    return names
+
+
+def validate_resume_compatibility(
+    checkpoint: Dict[str, Any],
+    config: Any,
+    checkpoint_path: Path,
+) -> None:
+    """Reject accidental cross-experiment or cross-architecture resume."""
+    saved_config = checkpoint.get("config")
+    if not isinstance(saved_config, dict):
+        raise ValueError(
+            "Resume checkpoint lacks its original config metadata: "
+            f"{checkpoint_path}"
+        )
+
+    current = to_plain_dict(config)
+
+    comparisons = {
+        "experiment.name": (
+            saved_config.get("experiment", {}).get("name"),
+            current.get("experiment", {}).get("name"),
+        ),
+        "model.architecture": (
+            str(
+                saved_config.get("model", {}).get("architecture", "")
+            ).lower(),
+            str(
+                current.get("model", {}).get("architecture", "")
+            ).lower(),
+        ),
+        "reproducibility.seed": (
+            saved_config.get("reproducibility", {}).get("seed"),
+            current.get("reproducibility", {}).get("seed"),
+        ),
+        "data.targets": (
+            _target_names_from_config(saved_config),
+            _target_names_from_config(current),
+        ),
+    }
+
+    mismatches = {
+        key: values
+        for key, values in comparisons.items()
+        if values[0] != values[1]
+    }
+
+    if mismatches:
+        raise ValueError(
+            "Resume checkpoint is incompatible with the active config: "
+            f"{checkpoint_path}; mismatches={mismatches}"
+        )
+
+
+def resume_training_checkpoint(
+    *,
+    checkpoint_path: Path,
+    trainer: HydroTrainer,
+    config: Any,
+    device: torch.device,
+    monitor_name: str,
+    monitor_mode: str,
+) -> Dict[str, Any]:
+    """Restore model, optimizer, scheduler, scaler, and RNG state."""
+    checkpoint_path = Path(checkpoint_path)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"Resume checkpoint not found: {checkpoint_path}"
+        )
+
+    checkpoint = load_torch_checkpoint(
+        checkpoint_path,
+        device,
+    )
+
+    if not isinstance(checkpoint, dict):
+        raise ValueError(
+            "A resumable checkpoint must be a dictionary: "
+            f"{checkpoint_path}"
+        )
+
+    required = {
+        "epoch",
+        "model_state_dict",
+        "optimizer_state_dict",
+    }
+    missing = sorted(
+        key for key in required
+        if checkpoint.get(key) is None
+    )
+    if missing:
+        raise ValueError(
+            "Checkpoint is not resumable because required fields are "
+            f"missing: {missing}; path={checkpoint_path}"
+        )
+
+    validate_resume_compatibility(
+        checkpoint,
+        config,
+        checkpoint_path,
+    )
+
+    saved_monitor_name = checkpoint.get("monitor_name")
+    saved_monitor_mode = checkpoint.get("monitor_mode")
+    if (
+        saved_monitor_name not in {None, monitor_name}
+        or saved_monitor_mode not in {None, monitor_mode}
+    ):
+        raise ValueError(
+            "Resume monitor differs from the active config: "
+            f"checkpoint=({saved_monitor_name}, {saved_monitor_mode}), "
+            f"current=({monitor_name}, {monitor_mode})."
+        )
+
+    trainer.model.load_state_dict(
+        checkpoint["model_state_dict"],
+        strict=True,
+    )
+    trainer.optimizer.load_state_dict(
+        checkpoint["optimizer_state_dict"]
+    )
+    move_optimizer_state_to_device(
+        trainer.optimizer,
+        device,
+    )
+
+    scheduler_state = checkpoint.get("scheduler_state_dict")
+    if trainer.scheduler is not None:
+        if scheduler_state is None:
+            raise ValueError(
+                "Active config uses a scheduler but the resume checkpoint "
+                f"does not contain scheduler state: {checkpoint_path}"
+            )
+        trainer.scheduler.load_state_dict(scheduler_state)
+
+    scaler_state = checkpoint.get("scaler_state_dict")
+    if trainer.amp_enabled and scaler_state is None:
+        raise ValueError(
+            "AMP is enabled but the resume checkpoint lacks scaler state: "
+            f"{checkpoint_path}"
+        )
+    if scaler_state is not None:
+        trainer.scaler.load_state_dict(scaler_state)
+
+    restore_rng_state(checkpoint.get("rng_state"))
+    return checkpoint
+
+
+def load_resume_history(
+    *,
+    checkpoint: Dict[str, Any],
+    history_path: Path,
+    checkpoint_epoch: int,
+) -> List[Dict[str, Any]]:
+    """Restore history from the checkpoint, falling back to the CSV."""
+    checkpoint_history = checkpoint.get("history_records")
+
+    if isinstance(checkpoint_history, list):
+        frame = pd.DataFrame(checkpoint_history)
+    elif history_path.exists():
+        frame = pd.read_csv(history_path)
+    else:
+        frame = pd.DataFrame()
+
+    if frame.empty:
+        return []
+
+    if "epoch" not in frame.columns:
+        raise ValueError(
+            f"Training history has no epoch column: {history_path}"
+        )
+
+    frame = frame[frame["epoch"] <= checkpoint_epoch]
+    frame = (
+        frame.drop_duplicates(subset=["epoch"], keep="last")
+        .sort_values("epoch")
+        .reset_index(drop=True)
+    )
+    return frame.to_dict(orient="records")
+
+
+def atomic_write_history(
+    history_records: List[Dict[str, Any]],
+    history_path: Path,
+) -> None:
+    """Atomically persist one deduplicated epoch history table."""
+    frame = pd.DataFrame(history_records)
+    if not frame.empty and "epoch" in frame.columns:
+        frame = (
+            frame.drop_duplicates(subset=["epoch"], keep="last")
+            .sort_values("epoch")
+            .reset_index(drop=True)
+        )
+
+    temporary_path = history_path.with_name(
+        history_path.name + ".tmp"
+    )
+    frame.to_csv(temporary_path, index=False)
+    temporary_path.replace(history_path)
+
+
 def load_model_checkpoint(model: torch.nn.Module, checkpoint_path: Path, device: torch.device) -> Dict[str, Any]:
     """Load old raw state_dict checkpoints and new full checkpoint payloads."""
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = load_torch_checkpoint(checkpoint_path, device)
 
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         model.load_state_dict(checkpoint["model_state_dict"])
@@ -346,6 +730,127 @@ def load_model_checkpoint(model: torch.nn.Module, checkpoint_path: Path, device:
         "monitor_value": None,
         "model_state_dict": checkpoint,
     }
+
+
+def initialize_model_from_checkpoint(
+    model: torch.nn.Module,
+    checkpoint_path: Path,
+    device: torch.device,
+    strict: bool = True,
+) -> Dict[str, Any]:
+    """
+    Initialize model weights from a pretraining checkpoint.
+
+    Only model parameters are restored. Optimizer and scheduler states are not
+    loaded because the downstream Q+SSM stage is a new fine-tuning run.
+    """
+    checkpoint_path = Path(checkpoint_path)
+
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"Initialization checkpoint not found: {checkpoint_path}"
+        )
+
+    checkpoint = load_torch_checkpoint(checkpoint_path, device)
+    state_dict = (
+        checkpoint["model_state_dict"]
+        if isinstance(checkpoint, dict)
+        and "model_state_dict" in checkpoint
+        else checkpoint
+    )
+
+    incompatible = model.load_state_dict(
+        state_dict,
+        strict=strict,
+    )
+
+    missing_keys = list(
+        getattr(incompatible, "missing_keys", [])
+    )
+    unexpected_keys = list(
+        getattr(incompatible, "unexpected_keys", [])
+    )
+
+    print(
+        "Initialized model from checkpoint: "
+        f"{checkpoint_path} | strict={strict} | "
+        f"missing={len(missing_keys)} | "
+        f"unexpected={len(unexpected_keys)}",
+        flush=True,
+    )
+
+    if missing_keys:
+        print(
+            f"  Missing keys examples: {missing_keys[:8]}",
+            flush=True,
+        )
+
+    if unexpected_keys:
+        print(
+            f"  Unexpected keys examples: {unexpected_keys[:8]}",
+            flush=True,
+        )
+
+    if isinstance(checkpoint, dict):
+        return checkpoint
+
+    return {
+        "epoch": None,
+        "monitor_name": None,
+        "monitor_mode": None,
+        "monitor_value": None,
+        "model_state_dict": state_dict,
+    }
+
+
+def resolve_initialization_checkpoint(
+    config: Any,
+    cli_checkpoint: Optional[str],
+) -> Optional[Path]:
+    """
+    Resolve an optional initialization checkpoint.
+
+    The command-line value has priority. Configuration values are accepted as
+    a fallback, but unresolved ``__CHECKPOINT__:...`` placeholders must be
+    handled by the Chapter 4 protocol runner before invoking ``main.py``.
+    """
+    candidates: List[Any] = [cli_checkpoint]
+
+    for section_name, key_name in (
+        (None, "init_checkpoint"),
+        ("training", "init_checkpoint"),
+        ("model", "init_checkpoint"),
+        ("model", "checkpoint_path"),
+        ("model_params", "weight_path"),
+        ("ch4_qssm", "init_checkpoint"),
+    ):
+        if section_name is None:
+            candidates.append(config.get(key_name))
+            continue
+
+        section = config.get(section_name, {})
+        if isinstance(section, dict):
+            candidates.append(section.get(key_name))
+
+    for value in candidates:
+        if value is None:
+            continue
+
+        text = str(value).strip()
+        if not text or text.lower() in {"none", "null"}:
+            continue
+
+        if text.startswith("__CHECKPOINT__:"):
+            raise ValueError(
+                "Unresolved initialization checkpoint placeholder: "
+                f"{text}. Run this configuration through "
+                "run_ch4a_q_to_ssm_protocol.py so the Q-pretraining "
+                "checkpoint is resolved first."
+            )
+
+        return Path(text)
+
+    return None
 
 
 def export_experiment_metadata(
@@ -367,9 +872,17 @@ def export_experiment_metadata(
         "num_train_basins": len(train_basins),
         "num_test_basins": len(test_basins),
         "train_period": list(config.data.train_period),
-        "val_period": list(config.data.val_period),
+        "val_period": period_to_list(getattr(config.data, "val_period", None)),
         "test_period": list(config.data.test_period),
         "loss_weights": args.loss_weights,
+        "init_checkpoint": getattr(
+            args,
+            "init_checkpoint",
+            None,
+        ),
+        "strict_init": bool(
+            getattr(args, "strict_init", False)
+        ),
     }
 
     with open(save_dir / "metadata.json", "w", encoding="utf-8") as f:
@@ -398,7 +911,7 @@ def print_run_header(
     print(f"Device            : {device}")
     print(f"Split             : {split_label}")
     print(f"Basins            : total={len(all_basin_ids)} | train={len(train_basins)} | test={len(test_basins)}")
-    print(f"Periods           : train={list(config.data.train_period)} | val={list(config.data.val_period)} | test={list(config.data.test_period)}")
+    print(f"Periods           : train={period_to_list(config.data.train_period)} | val={period_to_list(getattr(config.data, 'val_period', None))} | test={period_to_list(config.data.test_period)}")
 
     for msg in override_msgs:
         print(msg)
@@ -546,7 +1059,7 @@ def run_climate_diagnostics(config: Any, basin_ids: List[str], ds_export: Any, s
     snow_dict = dict(zip(metadata_df["basin_id"], metadata_df.get("snow_fraction", np.nan)))
 
     analyzer = ClimateSpecializationAnalyzer(aridity_dict, snow_dict)
-    target_names = [str(t["name"]).lower() for t in config.data.targets]
+    target_names = [get_target_name(t) for t in config.data.targets]
 
     for task in target_names:
         gate_var = f"gate_{task}"
@@ -576,7 +1089,60 @@ def main() -> None:
     parser.add_argument("--baseline_metrics_csv", type=str, default=None)
     parser.add_argument("--loss_weights", type=str, nargs="+", default=None, help="Override target loss weights: task=weight")
     parser.add_argument("--quiet_batches", action="store_true", help="Disable optional inner batch progress bars.")
+    parser.add_argument(
+        "--init_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Optional checkpoint used to initialize model weights "
+            "before training."
+        ),
+    )
+    parser.add_argument(
+        "--strict_init",
+        action="store_true",
+        help=(
+            "Require exact model-key matching when loading "
+            "--init_checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume this experiment from its last_model.pth checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--resume_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Explicit full-state checkpoint used to resume the same "
+            "experiment."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.resume and args.resume_checkpoint:
+        raise ValueError(
+            "Use either --resume or --resume_checkpoint, not both."
+        )
+
+    resume_requested = bool(
+        args.resume or args.resume_checkpoint
+    )
+
+    if args.mode != "train" and resume_requested:
+        raise ValueError(
+            "Resume options are valid only with --mode train."
+        )
+
+    if args.init_checkpoint and resume_requested:
+        raise ValueError(
+            "--init_checkpoint cannot be combined with --resume or "
+            "--resume_checkpoint."
+        )
 
     with open(args.config, "r", encoding="utf-8") as f:
         config = edict(yaml.safe_load(f))
@@ -593,7 +1159,7 @@ def main() -> None:
     weight_dict, override_msgs = parse_loss_weights(args.loss_weights)
 
     for target in config.data.targets:
-        task_name = str(target.name).lower()
+        task_name = get_target_name(target)
         if task_name in weight_dict:
             target.loss_weight = weight_dict[task_name]
             override_msgs.append(f"Loss weight override: {task_name}={target.loss_weight}")
@@ -662,6 +1228,36 @@ def main() -> None:
     model = build_model(config)
 
     if args.mode == "train":
+        resume_checkpoint_path: Optional[Path] = None
+
+        if args.resume_checkpoint:
+            resume_checkpoint_path = Path(
+                args.resume_checkpoint
+            ).expanduser()
+            if not resume_checkpoint_path.is_absolute():
+                resume_checkpoint_path = (
+                    PROJECT_ROOT / resume_checkpoint_path
+                ).resolve()
+        elif args.resume:
+            resume_checkpoint_path = (
+                save_dir / "last_model.pth"
+            ).resolve()
+
+        init_checkpoint = None
+        if resume_checkpoint_path is None:
+            init_checkpoint = resolve_initialization_checkpoint(
+                config=config,
+                cli_checkpoint=args.init_checkpoint,
+            )
+
+        if init_checkpoint is not None:
+            initialize_model_from_checkpoint(
+                model=model,
+                checkpoint_path=init_checkpoint,
+                device=device,
+                strict=bool(args.strict_init),
+            )
+
         train_loader, val_loader, _, global_scaler = get_hydro_dataloaders(
             config,
             basin_ids=train_basins,
@@ -669,11 +1265,19 @@ def main() -> None:
             ungauged_basins=ungauged_list,
         )
 
+        validation_period = first_available_period(
+            config.data,
+            "val_period",
+            "valid_period",
+            "validation_period",
+        )
+        use_validation = not period_is_missing(validation_period)
+
         print("\n" + "=" * 112)
         print("Dataset Diagnostics")
         print("-" * 112)
         print(f"Train Loader Batches  : {len(train_loader):,}")
-        print(f"Validation Batches    : {len(val_loader):,}")
+        print(f"Validation Batches    : {len(val_loader) if val_loader is not None else 0:,}")
         print(f"Batch Size            : {train_loader.batch_size}")
         print("=" * 112 + "\n")
 
@@ -725,19 +1329,146 @@ def main() -> None:
         diag_interval = int(diag_cfg.get("epoch_interval", getattr(config.training, "diagnostic_interval", 10)))
         diag_interval = max(1, diag_interval)
 
+        history_path = save_dir / "training_history.csv"
         history_records: List[Dict[str, Any]] = []
+        start_epoch = 1
 
-        for epoch in range(1, epochs + 1):
+        if resume_checkpoint_path is not None:
+            resume_payload = resume_training_checkpoint(
+                checkpoint_path=resume_checkpoint_path,
+                trainer=trainer,
+                config=config,
+                device=device,
+                monitor_name=monitor_name,
+                monitor_mode=monitor_mode,
+            )
+
+            checkpoint_epoch = int(resume_payload["epoch"])
+            if checkpoint_epoch > epochs:
+                raise ValueError(
+                    "Resume checkpoint exceeds target epochs: "
+                    f"checkpoint={checkpoint_epoch}, target={epochs}."
+                )
+
+            start_epoch = checkpoint_epoch + 1
+            last_epoch = checkpoint_epoch
+            last_monitor_value = float(
+                resume_payload.get(
+                    "monitor_value",
+                    float("nan"),
+                )
+            )
+            best_monitor_value = resume_payload.get(
+                "best_monitor_value",
+                resume_payload.get("monitor_value"),
+            )
+            if best_monitor_value is not None:
+                best_monitor_value = float(best_monitor_value)
+
+            best_epoch = int(
+                resume_payload.get(
+                    "best_epoch",
+                    checkpoint_epoch,
+                )
+            )
+            best_streamflow_nse = float(
+                resume_payload.get(
+                    "best_streamflow_nse",
+                    -float("inf"),
+                )
+            )
+            best_evapotranspiration_nse = float(
+                resume_payload.get(
+                    "best_evapotranspiration_nse",
+                    -float("inf"),
+                )
+            )
+            best_metrics = dict(
+                resume_payload.get("best_metrics", {})
+            )
+            best_per_basin_metrics = dict(
+                resume_payload.get(
+                    "best_per_basin_metrics",
+                    {},
+                )
+            )
+            last_val_metrics = dict(
+                resume_payload.get("last_val_metrics", {})
+            )
+            last_val_per_basin_metrics = dict(
+                resume_payload.get(
+                    "last_val_per_basin_metrics",
+                    {},
+                )
+            )
+
+            history_records = load_resume_history(
+                checkpoint=resume_payload,
+                history_path=history_path,
+                checkpoint_epoch=checkpoint_epoch,
+            )
+
+            saved_gradient_history = resume_payload.get(
+                "gradient_history"
+            )
+            if isinstance(saved_gradient_history, list):
+                trainer.gradient_history = list(
+                    saved_gradient_history
+                )
+
+            early_state = resume_payload.get(
+                "early_stopping_state"
+            )
+            if isinstance(early_state, dict):
+                early_stop.load_state_dict(early_state)
+
+            ckpt.best_value = best_monitor_value
+            atomic_write_history(
+                history_records,
+                history_path,
+            )
+
+            print("Resuming training.")
+            print(f"Checkpoint          : {resume_checkpoint_path}")
+            print(f"Checkpoint epoch    : {checkpoint_epoch}")
+            print(f"Start epoch         : {start_epoch}")
+            print(f"Target epoch        : {epochs}")
+            print("Model state         : restored")
+            print("Optimizer state     : restored")
+            print(
+                "Scheduler state     : "
+                + (
+                    "restored"
+                    if trainer.scheduler is not None
+                    else "not configured"
+                )
+            )
+            print(
+                "AMP scaler state    : "
+                + (
+                    "restored"
+                    if trainer.amp_enabled
+                    else "disabled"
+                )
+            )
+
+        for epoch in range(start_epoch, epochs + 1):
             epoch_start = time.time()
             last_epoch = epoch
             trainer.current_epoch = epoch
             log_gradients = diag_enabled and (epoch == 1 or epoch % diag_interval == 0)
 
             train_loss, task_losses, grad_sims = trainer.train_epoch(train_loader, log_gradients=log_gradients)
-            val_loss, val_metrics, val_per_basin_metrics, _, val_diags = trainer.validate(
-                val_loader,
-                period_dates=config.data.val_period,
-            )
+            if use_validation:
+                val_loss, val_metrics, val_per_basin_metrics, _, val_diags = trainer.validate(
+                    val_loader,
+                    period_dates=validation_period,
+                )
+            else:
+                val_loss = float(train_loss)
+                val_metrics = {}
+                val_per_basin_metrics = {}
+                val_diags = {}
 
             last_val_metrics = val_metrics
             last_val_per_basin_metrics = val_per_basin_metrics
@@ -780,16 +1511,24 @@ def main() -> None:
                 is_best=is_best,
                 optimizer=trainer.optimizer,
                 scheduler=trainer.scheduler,
+                scaler=trainer.scaler,
                 monitor_name=monitor_name,
                 monitor_mode=monitor_mode,
                 extra={
                     "val_loss": float(val_loss),
                     "train_loss": float(train_loss),
+                    "best_epoch": int(best_epoch),
+                    "best_monitor_value": (
+                        float(best_monitor_value)
+                        if best_monitor_value is not None
+                        else None
+                    ),
                     "config": to_plain_dict(config),
                 },
             )
 
-            early_stop.step(monitor_value)
+            if bool(early_cfg.get("enabled", True)):
+                early_stop.step(monitor_value)
 
             lr = trainer.optimizer.param_groups[0]["lr"]
             elapsed = time.time() - epoch_start
@@ -824,29 +1563,100 @@ def main() -> None:
             history_row.update(grad_sims)
             history_row.update(val_metrics)
             history_records.append(history_row)
+            atomic_write_history(
+                history_records,
+                history_path,
+            )
+
+            ckpt.save_last(
+                model=trainer.model,
+                epoch=epoch,
+                monitor_value=monitor_value,
+                optimizer=trainer.optimizer,
+                scheduler=trainer.scheduler,
+                scaler=trainer.scaler,
+                monitor_name=monitor_name,
+                monitor_mode=monitor_mode,
+                filename="last_model.pth",
+                extra={
+                    "train_loss": float(train_loss),
+                    "val_loss": float(val_loss),
+                    "best_epoch": int(best_epoch),
+                    "best_monitor_value": (
+                        float(best_monitor_value)
+                        if best_monitor_value is not None
+                        else None
+                    ),
+                    "best_streamflow_nse": float(best_streamflow_nse),
+                    "best_evapotranspiration_nse": float(
+                        best_evapotranspiration_nse
+                    ),
+                    "best_metrics": dict(best_metrics),
+                    "best_per_basin_metrics": dict(
+                        best_per_basin_metrics
+                    ),
+                    "last_val_metrics": dict(last_val_metrics),
+                    "last_val_per_basin_metrics": dict(
+                        last_val_per_basin_metrics
+                    ),
+                    "history_records": list(history_records),
+                    "gradient_history": list(
+                        trainer.gradient_history
+                    ),
+                    "early_stopping_state": early_stop.state_dict(),
+                    "config": to_plain_dict(config),
+                },
+            )
 
             if log_gradients and epoch > 1:
                 print_diagnostics(epoch, val_diags)
 
             release_memory()
 
-            if getattr(early_stop, "early_stop", False):
+            if bool(early_cfg.get("enabled", True)) and getattr(early_stop, "early_stop", False):
                 print("Early stopping triggered.")
                 break
 
         print("-" * 112)
         print(f"Best epoch: {best_epoch:03d}")
 
+        final_checkpoint_extra = {
+            "best_epoch": int(best_epoch),
+            "best_monitor_value": (
+                float(best_monitor_value)
+                if best_monitor_value is not None
+                else None
+            ),
+            "best_streamflow_nse": float(best_streamflow_nse),
+            "best_evapotranspiration_nse": float(
+                best_evapotranspiration_nse
+            ),
+            "best_metrics": dict(best_metrics),
+            "best_per_basin_metrics": dict(
+                best_per_basin_metrics
+            ),
+            "last_val_metrics": dict(last_val_metrics),
+            "last_val_per_basin_metrics": dict(
+                last_val_per_basin_metrics
+            ),
+            "history_records": list(history_records),
+            "gradient_history": list(trainer.gradient_history),
+            "early_stopping_state": early_stop.state_dict(),
+            "training_complete": bool(last_epoch >= epochs),
+            "config": to_plain_dict(config),
+        }
+
         ckpt.save_last(
             model=trainer.model,
             epoch=last_epoch,
             monitor_value=last_monitor_value,
             optimizer=trainer.optimizer,
             scheduler=trainer.scheduler,
+            scaler=trainer.scaler,
             monitor_name=monitor_name,
             monitor_mode=monitor_mode,
             filename="last_model.pth",
-            extra={"config": to_plain_dict(config)},
+            extra=final_checkpoint_extra,
         )
         ckpt.save_last(
             model=trainer.model,
@@ -854,18 +1664,19 @@ def main() -> None:
             monitor_value=last_monitor_value,
             optimizer=trainer.optimizer,
             scheduler=trainer.scheduler,
+            scaler=trainer.scaler,
             monitor_name=monitor_name,
             monitor_mode=monitor_mode,
             filename="final_model.pth",
-            extra={"config": to_plain_dict(config)},
+            extra=final_checkpoint_extra,
         )
 
         best_path = save_dir / "best_model.pth"
-        if best_path.exists():
+        if use_validation and best_path.exists():
             load_model_checkpoint(trainer.model, best_path, device)
             _, best_metrics, best_per_basin_metrics, _, _ = trainer.validate(
                 val_loader,
-                period_dates=config.data.val_period,
+                period_dates=validation_period,
             )
 
         final_metrics = dict(best_metrics if best_metrics else last_val_metrics)
@@ -892,7 +1703,7 @@ def main() -> None:
             float(np.nanmean(shared_expert_sims)) if shared_expert_sims else np.nan
         )
 
-        pd.DataFrame(history_records).to_csv(save_dir / "training_history.csv", index=False)
+        atomic_write_history(history_records, history_path)
         pd.DataFrame([final_metrics]).to_csv(save_dir / "validation_summary.csv", index=False)
 
         if final_per_basin_metrics:
@@ -915,9 +1726,19 @@ def main() -> None:
             scaler_basin_ids=train_basins,
         )
 
-        best_model = save_dir / "best_model.pth"
-        if not best_model.exists():
+        validation_period = first_available_period(
+            config.data,
+            "val_period",
+            "valid_period",
+            "validation_period",
+        )
+
+        if period_is_missing(validation_period):
             best_model = save_dir / "final_model.pth"
+        else:
+            best_model = save_dir / "best_model.pth"
+            if not best_model.exists():
+                best_model = save_dir / "final_model.pth"
 
         if not best_model.exists():
             print(f"[FATAL] No trained model found in {save_dir}. Run training first.")

@@ -20,16 +20,31 @@ class HydroEvaluator:
         self.basin_ids = basin_ids
         self.scaler = scaler
         self.task_names = [str(t['name']).lower() for t in config.data.targets]
+        self.target_configs = {
+            str(target['name']).lower(): dict(target)
+            for target in config.data.targets
+        }
         self.target_metrics = [m.lower() for m in config.evaluation_protocol.metrics]
 
     def process_and_evaluate(self, collected_data: Dict[str, Any], period_dates: List[str]) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]], Optional[xr.Dataset]]:
         """Reconstructs continuous physical timeseries without index shift modifications."""
         num_basins = len(self.basin_ids)
-        seq_len = self.config.data.get('sequence_length', 180)
-        
-        start_date = pd.to_datetime(period_dates[0]) + pd.Timedelta(days=seq_len - 1)
+        start_date = pd.to_datetime(period_dates[0])
         end_date = pd.to_datetime(period_dates[1])
-        time_index = pd.date_range(start=start_date, end=end_date, freq='D')
+
+        if start_date > end_date:
+            raise ValueError(
+                "Invalid evaluation period: "
+                f"start_date={start_date.date()} is after "
+                f"end_date={end_date.date()}."
+            )
+
+        time_index = pd.date_range(
+            start=start_date,
+            end=end_date,
+            freq="D",
+        )
+
         num_days = len(time_index)
         
         reconstructed_preds = {t: np.full((num_basins, num_days), np.nan) for t in self.task_names}
@@ -57,6 +72,17 @@ class HydroEvaluator:
                 
                 phys_p = self.scaler.inverse_transform_target_safe(task, raw_p, stat_num_valid)
                 phys_o = self.scaler.inverse_transform_target_safe(task, raw_o, stat_num_valid)
+
+                # Convert native target values to the configured
+                # publication unit before metrics and export.
+                phys_p = self._apply_target_output_scale(
+                    task,
+                    phys_p,
+                )
+                phys_o = self._apply_target_output_scale(
+                    task,
+                    phys_o,
+                )
                 
                 reconstructed_preds[task][b_idx_valid, t_idx_valid] = phys_p
                 reconstructed_obs[task][b_idx_valid, t_idx_valid] = phys_o
@@ -127,6 +153,8 @@ class HydroEvaluator:
 
         self._assign_variable_units(ds_export)
 
+        self._assign_target_metadata(ds_export)
+
         return global_metrics, per_basin_metrics, ds_export
 
     def _assign_variable_units(self, ds_export: xr.Dataset) -> None:
@@ -149,6 +177,117 @@ class HydroEvaluator:
                 if var_name in ds_export:
                     ds_export[var_name].attrs["units"] = units
                     ds_export[var_name].attrs["long_name"] = f"{long_name} {suffix}"
+
+    def _apply_target_output_scale(
+        self,
+        task: str,
+        values: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Convert inverse-transformed native values to configured output units.
+
+        For Chapter 4 SSM, the processed source values are percent-like and
+        unit_scale=0.01 converts them to volumetric fraction in m3 m-3.
+        """
+        target_config = self.target_configs.get(
+            str(task).lower(),
+            {},
+        )
+
+        scale = float(
+            target_config.get("unit_scale", 1.0)
+        )
+
+        if not np.isfinite(scale) or scale <= 0.0:
+            raise ValueError(
+                f"Invalid unit_scale for target '{task}': {scale}."
+            )
+
+        # Upcast before unit conversion. Model outputs may be float16;
+        # multiplying float16 values by 0.01 would introduce avoidable
+        # quantization errors and slightly alter dimensionless metrics.
+        return np.asarray(values, dtype=np.float64) * scale
+
+
+    def _assign_target_metadata(
+        self,
+        dataset: xr.Dataset,
+    ) -> None:
+        """Attach target-specific physical units to exported variables."""
+        unit_notes = []
+
+        for task in self.task_names:
+            target_config = self.target_configs.get(
+                task,
+                {},
+            )
+
+            scale = float(
+                target_config.get("unit_scale", 1.0)
+            )
+
+            configured_unit = (
+                target_config.get("output_unit")
+                or target_config.get("units")
+            )
+
+            if configured_unit is not None:
+                output_unit = str(configured_unit)
+            elif "streamflow" in task:
+                output_unit = "m3 s-1"
+            elif "evapo" in task:
+                output_unit = "mm day-1"
+            elif (
+                "ssm" in task
+                or "soil_moisture" in task
+            ):
+                output_unit = "m3 m-3"
+            else:
+                output_unit = "native units"
+
+            long_name = str(
+                target_config.get(
+                    "long_name",
+                    task,
+                )
+            )
+
+            source_unit = str(
+                target_config.get(
+                    "source_unit",
+                    "native units",
+                )
+            )
+
+            for suffix, role in (
+                ("sim", "simulation"),
+                ("obs", "observation"),
+            ):
+                variable_name = f"{task}_{suffix}"
+
+                if variable_name not in dataset:
+                    continue
+
+                dataset[variable_name].attrs.update(
+                    {
+                        "units": output_unit,
+                        "long_name": (
+                            f"{long_name} {role}"
+                        ),
+                        "unit_scale_applied": scale,
+                        "source_units": source_unit,
+                    }
+                )
+
+            unit_notes.append(
+                f"{task}: {output_unit} "
+                f"(unit_scale={scale:g})"
+            )
+
+        dataset.attrs["unit_note"] = "; ".join(
+            unit_notes
+        )
+
 
     def _compute_local_metrics(self, preds: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor], metrics: List[str]) -> Dict[str, float]:
         """Calculates specific evaluation statistics safely converting CUDA tensors."""
@@ -178,7 +317,7 @@ class HydroEvaluator:
                     else:
                         r = np.corrcoef(p, t)[0, 1]
                         alpha = std_p / std_t
-                        beta = mean_p / (mean_t + 1e-8)
+                        beta = mean_p / mean_t
                         kge = 1.0 - np.sqrt((r - 1.0) ** 2 + (alpha - 1.0) ** 2 + (beta - 1.0) ** 2)
                         out_dict[f"{task}_kge"] = float(kge)
 
@@ -191,7 +330,7 @@ class HydroEvaluator:
                 elif m == "bias":
                     denom = np.sum(t)
                     relative_bias = (
-                        float(np.sum(p - t) / (denom + 1e-8))
+                        float(np.sum(p - t) / denom)
                         if abs(denom) > 1e-8
                         else float("nan")
                     )

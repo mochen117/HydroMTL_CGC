@@ -345,6 +345,7 @@ class HydroTrainer:
 
         epoch_loss = 0.0
         task_loss_sums = defaultdict(float)
+        task_loss_counts = defaultdict(int)
         grad_sim_sums = defaultdict(list)
         total_batches = 0
 
@@ -383,11 +384,20 @@ class HydroTrainer:
             with autocast(enabled=self.amp_enabled):
                 preds, _ = self.model(x, static_num, static_cat)
 
-                losses = {
-                    task: masked_rmse(preds[task], targets[task])
-                    for task in self.task_names
-                    if task in preds and task in targets
-                }
+                losses: Dict[str, torch.Tensor] = {}
+                for task in self.task_names:
+                    if task not in preds or task not in targets:
+                        continue
+
+                    valid_count = self.criterion.count_valid_observations(
+                        preds[task],
+                        targets[task],
+                    )
+                    if valid_count > 0:
+                        losses[task] = self.criterion.compute_task_loss(
+                            preds[task],
+                            targets[task],
+                        )
 
                 total_loss = self.criterion(preds, targets, static_num)
 
@@ -395,18 +405,33 @@ class HydroTrainer:
             max_diag_batches = int(diag_cfg.get("gradient_batches_per_epoch", 5))
             fail_on_error = bool(diag_cfg.get("fail_on_error", False))
 
+            active_diagnostic_tasks = [
+                task
+                for task in self.task_names
+                if self.task_weights.get(task, 0.0) > 0.0
+                and task in losses
+            ]
+
             if (
                 log_gradients
                 and batch_idx <= max_diag_batches
-                and "streamflow" in losses
-                and "evapotranspiration" in losses
+                and len(active_diagnostic_tasks) >= 2
             ):
+                task_a, task_b = active_diagnostic_tasks[:2]
+
                 try:
                     sim_dict = self.compute_gradient_similarity(
-                        losses["streamflow"],
-                        losses["evapotranspiration"],
+                        losses[task_a],
+                        losses[task_b],
                     )
+
+                    sim_dict["diagnostic_task_a"] = task_a
+                    sim_dict["diagnostic_task_b"] = task_b
+
                     for key, value in sim_dict.items():
+                        if isinstance(value, str):
+                            continue
+
                         if np.isfinite(value):
                             grad_sim_sums[key].append(value)
                 except Exception as exc:
@@ -418,6 +443,13 @@ class HydroTrainer:
                         RuntimeWarning,
                     )
                     grad_sim_sums["gradient_failures"].append(1.0)
+
+            if not torch.isfinite(total_loss):
+                raise FloatingPointError(
+                    "Non-finite total loss detected: "
+                    f"epoch={self.current_epoch}, batch={batch_idx}, "
+                    f"value={total_loss.detach().cpu().item()}."
+                )
 
             self.scaler.scale(total_loss).backward()
             self.scaler.unscale_(self.optimizer)
@@ -434,6 +466,7 @@ class HydroTrainer:
 
             for task, loss_tensor in losses.items():
                 task_loss_sums[task] += float(loss_tensor.detach().cpu().item())
+                task_loss_counts[task] += 1
 
             total_batches += 1
 
@@ -446,7 +479,7 @@ class HydroTrainer:
         avg_loss = epoch_loss / max(1, total_batches)
 
         avg_task_losses = {
-            task: value / max(1, total_batches)
+            task: value / max(1, task_loss_counts[task])
             for task, value in task_loss_sums.items()
         }
 
@@ -506,6 +539,13 @@ class HydroTrainer:
             with autocast(enabled=self.amp_enabled):
                 preds, gates = self.model(x, static_num, static_cat)
                 total_loss = self.criterion(preds, targets, static_num)
+
+            if not torch.isfinite(total_loss):
+                raise FloatingPointError(
+                    "Non-finite validation loss detected: "
+                    f"epoch={self.current_epoch}, "
+                    f"value={total_loss.detach().cpu().item()}."
+                )
 
             epoch_loss += float(total_loss.detach().cpu().item())
             total_batches += 1

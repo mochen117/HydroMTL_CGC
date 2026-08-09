@@ -7,9 +7,11 @@
 
 from __future__ import annotations
 
+import random
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import numpy as np
 import torch
 
 
@@ -73,14 +75,32 @@ class EarlyStopping:
         self.counter += 1
         if self.counter >= self.patience:
             self.early_stop = True
-            if self.restore_best_weights and model is not None and self.best_weights is not None:
+            if (
+                self.restore_best_weights
+                and model is not None
+                and self.best_weights is not None
+            ):
                 model.load_state_dict(self.best_weights)
 
         return False
 
+    def state_dict(self) -> Dict[str, Any]:
+        """Return serializable early-stopping state."""
+        return {
+            "best_value": self.best_value,
+            "counter": int(self.counter),
+            "early_stop": bool(self.early_stop),
+        }
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        """Restore early-stopping state."""
+        self.best_value = state.get("best_value")
+        self.counter = int(state.get("counter", 0))
+        self.early_stop = bool(state.get("early_stop", False))
+
 
 class ModelCheckpoint:
-    """Save best and optional epoch checkpoints with full training metadata."""
+    """Save best, latest, and final checkpoints with resumable state."""
 
     def __init__(
         self,
@@ -95,28 +115,84 @@ class ModelCheckpoint:
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
+    def _capture_rng_state() -> Dict[str, Any]:
+        """Capture Python, NumPy, CPU, and CUDA random-number states."""
+        numpy_state = np.random.get_state()
+
+        return {
+            "python": random.getstate(),
+            "numpy": {
+                "bit_generator": str(numpy_state[0]),
+                "state": numpy_state[1].tolist(),
+                "position": int(numpy_state[2]),
+                "has_gauss": int(numpy_state[3]),
+                "cached_gaussian": float(numpy_state[4]),
+            },
+            "torch_cpu": torch.get_rng_state(),
+            "torch_cuda": (
+                torch.cuda.get_rng_state_all()
+                if torch.cuda.is_available()
+                else None
+            ),
+        }
+
+    @staticmethod
+    def _atomic_torch_save(
+        payload: Dict[str, Any],
+        output_path: Path,
+    ) -> None:
+        """Write a checkpoint atomically to avoid partially written files."""
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = output_path.with_name(output_path.name + ".tmp")
+        torch.save(payload, temporary_path)
+        temporary_path.replace(output_path)
+
+    @classmethod
     def _build_payload(
+        cls,
         model: torch.nn.Module,
         epoch: int,
         monitor_value: float,
         optimizer: Optional[torch.optim.Optimizer] = None,
         scheduler: Optional[Any] = None,
+        scaler: Optional[Any] = None,
         monitor_name: str = "monitor",
         monitor_mode: str = "min",
         extra: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Create a checkpoint payload compatible with future audits."""
+        """Create a full checkpoint payload for evaluation and resumption."""
         payload: Dict[str, Any] = {
+            "checkpoint_format_version": 2,
             "epoch": int(epoch),
             "monitor_name": str(monitor_name),
             "monitor_mode": str(monitor_mode),
             "monitor_value": float(monitor_value),
             "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
-            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+            "optimizer_state_dict": (
+                optimizer.state_dict()
+                if optimizer is not None
+                else None
+            ),
+            "scheduler_state_dict": (
+                scheduler.state_dict()
+                if scheduler is not None
+                else None
+            ),
+            "scaler_state_dict": (
+                scaler.state_dict()
+                if scaler is not None
+                else None
+            ),
+            "rng_state": cls._capture_rng_state(),
         }
 
         if extra:
+            overlap = set(payload).intersection(extra)
+            if overlap:
+                raise ValueError(
+                    "Checkpoint extra metadata must not overwrite core fields: "
+                    f"{sorted(overlap)}"
+                )
             payload.update(extra)
 
         return payload
@@ -129,17 +205,19 @@ class ModelCheckpoint:
         is_best: bool,
         optimizer: Optional[torch.optim.Optimizer] = None,
         scheduler: Optional[Any] = None,
+        scaler: Optional[Any] = None,
         monitor_name: str = "monitor",
         monitor_mode: str = "min",
         extra: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Save the current checkpoint and update ``best_model.pth`` if needed."""
+        """Save an optional epoch checkpoint and update ``best_model.pth``."""
         payload = self._build_payload(
             model=model,
             epoch=epoch,
             monitor_value=monitor_value,
             optimizer=optimizer,
             scheduler=scheduler,
+            scaler=scaler,
             monitor_name=monitor_name,
             monitor_mode=monitor_mode,
             extra=extra,
@@ -147,16 +225,17 @@ class ModelCheckpoint:
 
         if not self.save_best_only:
             epoch_path = self.save_dir / f"checkpoint_epoch_{epoch:03d}.pth"
-            torch.save(payload, epoch_path)
+            self._atomic_torch_save(payload, epoch_path)
 
         if is_best:
             best_path = self.save_dir / "best_model.pth"
-            torch.save(payload, best_path)
+            self._atomic_torch_save(payload, best_path)
             self.best_value = float(monitor_value)
             if self.verbose:
                 print(
                     f"Epoch {epoch:03d}: best model saved "
-                    f"({monitor_name}={monitor_value:.6f}, mode={monitor_mode})."
+                    f"({monitor_name}={monitor_value:.6f}, "
+                    f"mode={monitor_mode})."
                 )
 
     def save_last(
@@ -166,22 +245,24 @@ class ModelCheckpoint:
         monitor_value: float,
         optimizer: Optional[torch.optim.Optimizer] = None,
         scheduler: Optional[Any] = None,
+        scaler: Optional[Any] = None,
         monitor_name: str = "monitor",
         monitor_mode: str = "min",
         filename: str = "last_model.pth",
         extra: Optional[Dict[str, Any]] = None,
     ) -> Path:
-        """Save the final epoch checkpoint and return the path."""
+        """Save a named full-state checkpoint and return its path."""
         payload = self._build_payload(
             model=model,
             epoch=epoch,
             monitor_value=monitor_value,
             optimizer=optimizer,
             scheduler=scheduler,
+            scaler=scaler,
             monitor_name=monitor_name,
             monitor_mode=monitor_mode,
             extra=extra,
         )
-        out_path = self.save_dir / filename
-        torch.save(payload, out_path)
-        return out_path
+        output_path = self.save_dir / filename
+        self._atomic_torch_save(payload, output_path)
+        return output_path

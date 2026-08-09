@@ -1,0 +1,44 @@
+Chapter 4 Experiment A Freeze
+=============================
+
+Experiment:
+Q-assisted SSM prediction under temporally limited SSM observations.
+
+Formal seed:
+42
+
+Basins:
+592 CAMELS-US basins
+
+Q pretraining target period:
+2005-04-01 -- 2015-03-31
+
+Joint/fine-tuning target period:
+2015-04-01 -- 2018-09-30
+
+Independent test target period:
+2018-10-01 -- 2021-09-30
+
+Formal models:
+- STL-Q
+- STL-SSM
+- Hard-MTL Q+SSM
+- CGC Q+SSM
+- Hard-MTL Q-pretrained -> Q+SSM
+- CGC Q-pretrained -> Q+SSM
+
+Training protocol:
+- sequence length: 365 days
+- batch size: 64
+- joint/fine-tune epochs: 100
+- Q-pretrain epochs: 200
+- base loss: RMSE
+- Q/SSM loss weights: 0.5 / 0.5
+- validation: disabled
+- early stopping: disabled
+- SSM interpolation: disabled
+
+Important missing-data semantics:
+- STL-SSM uses only target days with valid SSM observations.
+- Q+SSM models retain all valid Q target days.
+- Missing SSM observations are masked from the SSM loss.

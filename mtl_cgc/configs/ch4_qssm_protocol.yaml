@@ -1,0 +1,44 @@
+protocol:
+  sequence_length: 365
+  interval_semantics: inclusive
+  model_type: n_to_1
+
+periods:
+  q_pretrain:
+    train_period:
+      - "2005-10-01"
+      - "2015-09-30"
+    val_period: null
+    test_period:
+      - "2015-10-01"
+      - "2018-09-30"
+
+  q_to_ssm:
+    train_period:
+      - "2015-10-01"
+      - "2018-09-30"
+    val_period: null
+    test_period:
+      - "2018-10-01"
+      - "2021-09-30"
+
+  pub:
+    train_period:
+      - "2015-10-01"
+      - "2021-09-30"
+    val_period: null
+    test_period:
+      - "2015-10-01"
+      - "2021-09-30"
+
+naming:
+  architecture_aliases:
+    stl: STL
+    hps: Hard-MTL
+    cgc: CGC
+
+smoke:
+  epochs: 3
+  batch_size: 32
+  seed: 42
+  basin_list_path: experiments/ch4_qssm/basin_splits/smoke_basins.txt

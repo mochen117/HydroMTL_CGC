@@ -1,0 +1,16 @@
+{
+  "protocol": "q_to_ssm",
+  "review_status": "experiment_a_config_reviewed",
+  "seed": 42,
+  "batch_size": 64,
+  "configs": [
+    "mtl_cgc/configs/ch4_qssm_smoke/q_to_ssm/ch4a_stl_ssm_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_smoke/q_to_ssm/ch4a_stl_q_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_smoke/q_to_ssm/ch4a_hps_qssm_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_smoke/q_to_ssm/ch4a_cgc_qssm_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_smoke/q_to_ssm/ch4a_hps_qpre_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_smoke/q_to_ssm/ch4a_hps_qpre_finetune_qssm_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_smoke/q_to_ssm/ch4a_cgc_qpre_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_smoke/q_to_ssm/ch4a_cgc_qpre_finetune_qssm_seed42.yaml"
+  ]
+}

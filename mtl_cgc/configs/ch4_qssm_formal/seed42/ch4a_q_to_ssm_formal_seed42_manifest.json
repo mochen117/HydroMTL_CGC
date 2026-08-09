@@ -1,0 +1,35 @@
+{
+  "protocol": "q_to_ssm",
+  "review_status": "experiment_a_config_reviewed",
+  "run_tag": "formal",
+  "seed": 42,
+  "batch_size": 64,
+  "joint_epochs": 100,
+  "pretrain_epochs": 200,
+  "q_weight": 0.5,
+  "ssm_weight": 0.5,
+  "basin_file": "experiments/ch4_qssm/basin_splits/all_eligible_basins.txt",
+  "data_root": "output_592_basins",
+  "pretrain_period": [
+    "2005-04-01",
+    "2015-03-31"
+  ],
+  "finetune_train_period": [
+    "2015-04-01",
+    "2018-09-30"
+  ],
+  "test_period": [
+    "2018-10-01",
+    "2021-09-30"
+  ],
+  "configs": [
+    "mtl_cgc/configs/ch4_qssm_formal/seed42/q_to_ssm/ch4a_formal_stl_ssm_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_formal/seed42/q_to_ssm/ch4a_formal_stl_q_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_formal/seed42/q_to_ssm/ch4a_formal_hps_qssm_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_formal/seed42/q_to_ssm/ch4a_formal_cgc_qssm_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_formal/seed42/q_to_ssm/ch4a_formal_hps_qpre_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_formal/seed42/q_to_ssm/ch4a_formal_hps_qpre_finetune_qssm_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_formal/seed42/q_to_ssm/ch4a_formal_cgc_qpre_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_formal/seed42/q_to_ssm/ch4a_formal_cgc_qpre_finetune_qssm_seed42.yaml"
+  ]
+}

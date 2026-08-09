@@ -56,3 +56,10 @@ output_592_basins/
 model_checkpoints/
 experiments/
 results/
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# macOS metadata
+.DS_Store
