@@ -1,0 +1,56 @@
+{
+  "package_type": "overlay_patch",
+  "target_project": "HydroMTL_CGC",
+  "package_name": "ch4_qssm_pub_v3_2_runtime_fix",
+  "package_version": "3.2",
+  "protocol_version": "ch4b_pub_v3",
+  "experiment": "Chapter 4 Experiment B",
+  "design": "Spatial PUB with target-basin SSM auxiliary supervision and target-basin Q fully withheld",
+  "pub_period": [
+    "2015-04-01",
+    "2021-09-30"
+  ],
+  "formal_core_scenarios": [
+    "stl_q",
+    "hps_target_ssm",
+    "cgc_target_ssm"
+  ],
+  "spatial_cross_validation_folds": 5,
+  "scaler_scope": "source_only",
+  "formal_evaluation_target": "target-basin streamflow",
+  "source_code_root": "mtl_cgc/protocols/ch4_qssm_pub",
+  "config_root": "mtl_cgc/configs/ch4_qssm_pub",
+  "script_root": "scripts/ch4_qssm_pub",
+  "test_root": "tests/ch4_qssm_pub",
+  "runtime_results_root": "experiments/ch4_qssm_pub",
+  "frozen_core_overwrite": false,
+  "runtime_results_contains_source_code": false,
+  "runtime_fix": {
+    "type": "process_local_conda_libstdcxx_preload",
+    "module": "mtl_cgc/protocols/ch4_qssm_pub/native_runtime.py",
+    "mutates_conda_environment": false,
+    "required_preflight": "python scripts/ch4_qssm_pub/check_runtime_environment.py"
+  },
+  "run_profiles": {
+    "smoke": {
+      "default_epochs": 1,
+      "isolated_experiment_names": true
+    },
+    "formal": {
+      "default_epochs": 100,
+      "isolated_experiment_names": true
+    }
+  },
+  "cross_chapter_references": [
+    "Chapter 3 per-basin summary and catchment metadata",
+    "Chapter 4A formal seed42 per-basin results"
+  ],
+  "verification": {
+    "python_compile": "passed",
+    "shell_syntax": "passed",
+    "pytest_ch4b": "18 passed",
+    "installer_smoke_test": "passed",
+    "native_runtime_import_order_regression": "passed",
+    "note": "Real server netCDF4/xarray runtime must still be verified with check_runtime_environment.py before smoke training."
+  }
+}

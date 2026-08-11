@@ -1,0 +1,37 @@
+protocol_version: ch4b_pub_v3
+
+pub_period:
+  start: '2015-04-01'
+  end: '2021-09-30'
+
+spatial_cross_validation:
+  n_folds: 5
+  test_basin_scope: target_only
+  scaler_fit_scope: source_only
+
+training:
+  sequence_length: 365
+  batch_size: 64
+  formal_epochs: 100
+  smoke_epochs: 1
+  validation: null
+  early_stopping: false
+
+multi_task_loss:
+  streamflow: 0.5
+  ssm: 0.5
+
+runtime_layout:
+  results_root: experiments/ch4_qssm_pub
+  runs: experiments/ch4_qssm_pub/runs
+  protocol: experiments/ch4_qssm_pub/protocol
+  manifests: experiments/ch4_qssm_pub/manifests
+  ensemble: experiments/ch4_qssm_pub/ensemble
+  summary: experiments/ch4_qssm_pub/summary
+
+notes:
+  - Target-basin streamflow is never used for training.
+  - Target-basin SSM is training supervision only for target-SSM-assisted MTL scenarios.
+  - SSM remains a prediction target, not a dynamic input feature.
+  - Same-period train/test dates are valid because leakage control is spatial, not temporal.
+  - Smoke and formal profiles use different experiment names and cannot overwrite each other.
