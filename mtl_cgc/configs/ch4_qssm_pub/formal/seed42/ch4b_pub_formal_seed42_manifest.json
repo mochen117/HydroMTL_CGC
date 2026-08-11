@@ -1,0 +1,197 @@
+{
+  "protocol_version": "ch4b_pub_v3",
+  "seed": 42,
+  "run_profile": "formal",
+  "epochs": 100,
+  "subset": "core",
+  "base_config": "mtl_cgc/configs/ch4_qssm_formal/seed42/q_to_ssm/ch4a_formal_cgc_qssm_seed42.yaml",
+  "fold_manifest": "experiments/ch4_qssm_pub/protocol/pub_fold_manifest.json",
+  "pub_period": [
+    "2015-04-01",
+    "2021-09-30"
+  ],
+  "entries": [
+    {
+      "config": "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold01/ch4b_pub_formal_f01_stl_q_seed42.yaml",
+      "experiment_name": "ch4b_pub_formal_f01_stl_q_seed42",
+      "fold_id": 1,
+      "seed": 42,
+      "run_profile": "formal",
+      "scenario": "stl_q",
+      "group": "core",
+      "source_basin_file": "experiments/ch4_qssm_pub/protocol/fold01/source_basins.txt",
+      "target_basin_file": "experiments/ch4_qssm_pub/protocol/fold01/target_basins.txt"
+    },
+    {
+      "config": "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold01/ch4b_pub_formal_f01_hps_target_ssm_seed42.yaml",
+      "experiment_name": "ch4b_pub_formal_f01_hps_target_ssm_seed42",
+      "fold_id": 1,
+      "seed": 42,
+      "run_profile": "formal",
+      "scenario": "hps_target_ssm",
+      "group": "core",
+      "source_basin_file": "experiments/ch4_qssm_pub/protocol/fold01/source_basins.txt",
+      "target_basin_file": "experiments/ch4_qssm_pub/protocol/fold01/target_basins.txt"
+    },
+    {
+      "config": "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold01/ch4b_pub_formal_f01_cgc_target_ssm_seed42.yaml",
+      "experiment_name": "ch4b_pub_formal_f01_cgc_target_ssm_seed42",
+      "fold_id": 1,
+      "seed": 42,
+      "run_profile": "formal",
+      "scenario": "cgc_target_ssm",
+      "group": "core",
+      "source_basin_file": "experiments/ch4_qssm_pub/protocol/fold01/source_basins.txt",
+      "target_basin_file": "experiments/ch4_qssm_pub/protocol/fold01/target_basins.txt"
+    },
+    {
+      "config": "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold02/ch4b_pub_formal_f02_stl_q_seed42.yaml",
+      "experiment_name": "ch4b_pub_formal_f02_stl_q_seed42",
+      "fold_id": 2,
+      "seed": 42,
+      "run_profile": "formal",
+      "scenario": "stl_q",
+      "group": "core",
+      "source_basin_file": "experiments/ch4_qssm_pub/protocol/fold02/source_basins.txt",
+      "target_basin_file": "experiments/ch4_qssm_pub/protocol/fold02/target_basins.txt"
+    },
+    {
+      "config": "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold02/ch4b_pub_formal_f02_hps_target_ssm_seed42.yaml",
+      "experiment_name": "ch4b_pub_formal_f02_hps_target_ssm_seed42",
+      "fold_id": 2,
+      "seed": 42,
+      "run_profile": "formal",
+      "scenario": "hps_target_ssm",
+      "group": "core",
+      "source_basin_file": "experiments/ch4_qssm_pub/protocol/fold02/source_basins.txt",
+      "target_basin_file": "experiments/ch4_qssm_pub/protocol/fold02/target_basins.txt"
+    },
+    {
+      "config": "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold02/ch4b_pub_formal_f02_cgc_target_ssm_seed42.yaml",
+      "experiment_name": "ch4b_pub_formal_f02_cgc_target_ssm_seed42",
+      "fold_id": 2,
+      "seed": 42,
+      "run_profile": "formal",
+      "scenario": "cgc_target_ssm",
+      "group": "core",
+      "source_basin_file": "experiments/ch4_qssm_pub/protocol/fold02/source_basins.txt",
+      "target_basin_file": "experiments/ch4_qssm_pub/protocol/fold02/target_basins.txt"
+    },
+    {
+      "config": "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold03/ch4b_pub_formal_f03_stl_q_seed42.yaml",
+      "experiment_name": "ch4b_pub_formal_f03_stl_q_seed42",
+      "fold_id": 3,
+      "seed": 42,
+      "run_profile": "formal",
+      "scenario": "stl_q",
+      "group": "core",
+      "source_basin_file": "experiments/ch4_qssm_pub/protocol/fold03/source_basins.txt",
+      "target_basin_file": "experiments/ch4_qssm_pub/protocol/fold03/target_basins.txt"
+    },
+    {
+      "config": "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold03/ch4b_pub_formal_f03_hps_target_ssm_seed42.yaml",
+      "experiment_name": "ch4b_pub_formal_f03_hps_target_ssm_seed42",
+      "fold_id": 3,
+      "seed": 42,
+      "run_profile": "formal",
+      "scenario": "hps_target_ssm",
+      "group": "core",
+      "source_basin_file": "experiments/ch4_qssm_pub/protocol/fold03/source_basins.txt",
+      "target_basin_file": "experiments/ch4_qssm_pub/protocol/fold03/target_basins.txt"
+    },
+    {
+      "config": "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold03/ch4b_pub_formal_f03_cgc_target_ssm_seed42.yaml",
+      "experiment_name": "ch4b_pub_formal_f03_cgc_target_ssm_seed42",
+      "fold_id": 3,
+      "seed": 42,
+      "run_profile": "formal",
+      "scenario": "cgc_target_ssm",
+      "group": "core",
+      "source_basin_file": "experiments/ch4_qssm_pub/protocol/fold03/source_basins.txt",
+      "target_basin_file": "experiments/ch4_qssm_pub/protocol/fold03/target_basins.txt"
+    },
+    {
+      "config": "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold04/ch4b_pub_formal_f04_stl_q_seed42.yaml",
+      "experiment_name": "ch4b_pub_formal_f04_stl_q_seed42",
+      "fold_id": 4,
+      "seed": 42,
+      "run_profile": "formal",
+      "scenario": "stl_q",
+      "group": "core",
+      "source_basin_file": "experiments/ch4_qssm_pub/protocol/fold04/source_basins.txt",
+      "target_basin_file": "experiments/ch4_qssm_pub/protocol/fold04/target_basins.txt"
+    },
+    {
+      "config": "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold04/ch4b_pub_formal_f04_hps_target_ssm_seed42.yaml",
+      "experiment_name": "ch4b_pub_formal_f04_hps_target_ssm_seed42",
+      "fold_id": 4,
+      "seed": 42,
+      "run_profile": "formal",
+      "scenario": "hps_target_ssm",
+      "group": "core",
+      "source_basin_file": "experiments/ch4_qssm_pub/protocol/fold04/source_basins.txt",
+      "target_basin_file": "experiments/ch4_qssm_pub/protocol/fold04/target_basins.txt"
+    },
+    {
+      "config": "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold04/ch4b_pub_formal_f04_cgc_target_ssm_seed42.yaml",
+      "experiment_name": "ch4b_pub_formal_f04_cgc_target_ssm_seed42",
+      "fold_id": 4,
+      "seed": 42,
+      "run_profile": "formal",
+      "scenario": "cgc_target_ssm",
+      "group": "core",
+      "source_basin_file": "experiments/ch4_qssm_pub/protocol/fold04/source_basins.txt",
+      "target_basin_file": "experiments/ch4_qssm_pub/protocol/fold04/target_basins.txt"
+    },
+    {
+      "config": "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold05/ch4b_pub_formal_f05_stl_q_seed42.yaml",
+      "experiment_name": "ch4b_pub_formal_f05_stl_q_seed42",
+      "fold_id": 5,
+      "seed": 42,
+      "run_profile": "formal",
+      "scenario": "stl_q",
+      "group": "core",
+      "source_basin_file": "experiments/ch4_qssm_pub/protocol/fold05/source_basins.txt",
+      "target_basin_file": "experiments/ch4_qssm_pub/protocol/fold05/target_basins.txt"
+    },
+    {
+      "config": "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold05/ch4b_pub_formal_f05_hps_target_ssm_seed42.yaml",
+      "experiment_name": "ch4b_pub_formal_f05_hps_target_ssm_seed42",
+      "fold_id": 5,
+      "seed": 42,
+      "run_profile": "formal",
+      "scenario": "hps_target_ssm",
+      "group": "core",
+      "source_basin_file": "experiments/ch4_qssm_pub/protocol/fold05/source_basins.txt",
+      "target_basin_file": "experiments/ch4_qssm_pub/protocol/fold05/target_basins.txt"
+    },
+    {
+      "config": "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold05/ch4b_pub_formal_f05_cgc_target_ssm_seed42.yaml",
+      "experiment_name": "ch4b_pub_formal_f05_cgc_target_ssm_seed42",
+      "fold_id": 5,
+      "seed": 42,
+      "run_profile": "formal",
+      "scenario": "cgc_target_ssm",
+      "group": "core",
+      "source_basin_file": "experiments/ch4_qssm_pub/protocol/fold05/source_basins.txt",
+      "target_basin_file": "experiments/ch4_qssm_pub/protocol/fold05/target_basins.txt"
+    }
+  ],
+  "configs": [
+    "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold01/ch4b_pub_formal_f01_stl_q_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold01/ch4b_pub_formal_f01_hps_target_ssm_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold01/ch4b_pub_formal_f01_cgc_target_ssm_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold02/ch4b_pub_formal_f02_stl_q_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold02/ch4b_pub_formal_f02_hps_target_ssm_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold02/ch4b_pub_formal_f02_cgc_target_ssm_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold03/ch4b_pub_formal_f03_stl_q_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold03/ch4b_pub_formal_f03_hps_target_ssm_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold03/ch4b_pub_formal_f03_cgc_target_ssm_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold04/ch4b_pub_formal_f04_stl_q_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold04/ch4b_pub_formal_f04_hps_target_ssm_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold04/ch4b_pub_formal_f04_cgc_target_ssm_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold05/ch4b_pub_formal_f05_stl_q_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold05/ch4b_pub_formal_f05_hps_target_ssm_seed42.yaml",
+    "mtl_cgc/configs/ch4_qssm_pub/formal/seed42/fold05/ch4b_pub_formal_f05_cgc_target_ssm_seed42.yaml"
+  ]
+}

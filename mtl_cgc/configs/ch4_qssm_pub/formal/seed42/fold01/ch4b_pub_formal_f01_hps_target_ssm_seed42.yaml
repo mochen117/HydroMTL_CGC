@@ -1,0 +1,248 @@
+experiment:
+  name: ch4b_pub_formal_f01_hps_target_ssm_seed42
+  task: pub_q_from_auxiliary_ssm
+  timestamp: null
+  save_dir: experiments/ch4_qssm_pub/runs
+  chapter: ch4
+  experiment_id: ch4b
+data:
+  dataset: CAMELS_US_custom
+  data_root: output_592_basins
+  basin_metadata_path: /home/mochen/code/HydroMTL_CGC/data/basin_metadata.csv
+  show_loading_progress: true
+  basin_list_path: null
+  static_features:
+  - elev_mean
+  - slope_mean
+  - area_gages2
+  - frac_forest
+  - lai_max
+  - lai_diff
+  - dom_land_cover_frac
+  - root_depth_50
+  - soil_depth_statgso
+  - soil_porosity
+  - soil_conductivity
+  - max_water_content
+  - geol_porosity
+  - geol_permeability
+  - p_mean
+  - pet_mean
+  - aridity
+  - p_seasonality
+  - frac_snow
+  - sand_frac
+  - clay_frac
+  - organic_frac
+  - carbonate_rocks_frac
+  categorical_static_features:
+  - dom_land_cover
+  - geol_class_1st
+  - geol_class_2nd
+  - huc_02
+  categorical_num_classes:
+    dom_land_cover: 20
+    geol_class_1st: 20
+    geol_class_2nd: 20
+    huc_02: 20
+  categorical_embed_dims:
+    dom_land_cover: 6
+    geol_class_1st: 8
+    geol_class_2nd: 8
+    huc_02: 12
+  dynamic_features:
+  - total_precipitation
+  - temperature
+  - specific_humidity
+  - shortwave_radiation
+  - potential_energy
+  targets:
+  - name: streamflow
+    type: regression
+    loss_weight: 0.5
+    constraint: non_negative
+    interpolate_missing: true
+    output_unit: m3 s-1
+    long_name: streamflow
+  - name: ssm
+    type: regression
+    loss_weight: 0.5
+    constraint: non_negative
+    interpolate_missing: false
+    unit_scale: 0.01
+    source_unit: '%'
+    output_unit: m3 m-3
+    long_name: surface soil moisture
+  sequence_length: 365
+  prediction_horizon: 1
+  forecast_history: 365
+  train_period:
+  - '2015-04-01'
+  - '2021-09-30'
+  val_period: null
+  test_period:
+  - '2015-04-01'
+  - '2021-09-30'
+  spatial_split: true
+  spatial_split_type: explicit_pub_fold
+  normalize: true
+  fill_missing: true
+  causal_dynamic_imputation: true
+  batch_size: 64
+  num_workers: 0
+  pin_memory: false
+  basin_file: experiments/ch4_qssm/basin_splits/all_eligible_basins.txt
+  valid_period: null
+  validation_period: null
+  sample_filter:
+    enabled: false
+    required_valid_targets: []
+    apply_to_modes: []
+model:
+  architecture: hps
+  cgc:
+    shared_experts: 4
+    task_experts:
+    - 4
+    - 4
+    expert_hidden_dim: 256
+    use_attention_gate: true
+    temperature: 1.0
+    dropout_rate: 0.1
+  encoder:
+    type: lstm
+    hidden_dim: 64
+    num_layers: 2
+    bidirectional: false
+  task_towers:
+  - type: mlp
+    hidden_dim: 128
+    num_layers: 2
+    output_head: regression
+  - type: mlp
+    hidden_dim: 128
+    num_layers: 2
+    output_head: regression
+  physics_constraints:
+    water_balance:
+      enabled: false
+      alpha: 0.1
+      requires_precipitation: true
+training:
+  optimizer: adamw
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  clip_grad_norm: 1.0
+  use_amp: true
+  batch_progress: false
+  loss:
+    base_loss: rmse
+    multi_task_balancing: none
+    water_balance_weight: 0.0
+    eps: 1.0e-06
+  monitor:
+    name: loss
+    mode: min
+    min_delta: 0.0
+  scheduler:
+    type: reduce_on_plateau
+    mode: min
+    factor: 0.5
+    patience: 8
+    min_lr: 1.0e-06
+  epochs: 100
+  warmup_epochs: 0
+  early_stopping:
+    enabled: false
+    patience: 1000000
+    min_delta: 0.0
+  diagnostics:
+    enabled: true
+    epoch_interval: 1
+    gradient_batches_per_epoch: 5
+    fail_on_error: false
+  dropout: 0.1
+  batch_norm: true
+  save_frequency: 10
+  save_best_only: false
+  loss_weights:
+    streamflow: 0.5
+    ssm: 0.5
+evaluation_protocol:
+  metrics:
+  - nse
+  - kge
+  - rmse
+  - mae
+  - bias
+  - corr
+  primary_metric: streamflow_nse_median
+  save_top_k: 3
+  export_csv: true
+  export_netcdf: true
+experiment_tracking:
+  save_predictions: true
+  save_gate_weights: true
+  save_per_basin_metrics: true
+reproducibility:
+  deterministic: true
+  seed: 42
+logging:
+  level: INFO
+  tensorboard: true
+  wandb: false
+  console: true
+  file: true
+seed: 42
+ch4_qssm:
+  experiment_name: ch4a_formal_cgc_qssm_seed42
+  architecture: cgc
+  tasks:
+  - streamflow
+  - ssm
+  loss_weights:
+    streamflow: 0.5
+    ssm: 0.5
+  data_root: output_592_basins
+  train_period:
+  - '2015-04-01'
+  - '2018-09-30'
+  valid_period: null
+  test_period:
+  - '2018-10-01'
+  - '2021-09-30'
+  basin_file: experiments/ch4_qssm/basin_splits/all_eligible_basins.txt
+  train_basin_file: null
+  valid_basin_file: null
+  test_basin_file: null
+  init_checkpoint: null
+  scaler_stat_file: null
+  epochs: 100
+  batch_size: 64
+  seed: 42
+  protocol: q_to_ssm
+  val_period: null
+  validation_period: null
+pub:
+  enabled: true
+  protocol_version: ch4b_pub_v3
+  run_profile: formal
+  fold_id: 1
+  scenario: hps_target_ssm
+  source_basin_file: experiments/ch4_qssm_pub/protocol/fold01/source_basins.txt
+  target_basin_file: experiments/ch4_qssm_pub/protocol/fold01/target_basins.txt
+  scaler_fit_scope: source_only
+  test_basin_scope: target_only
+  evaluation_task: streamflow
+  same_period_spatial_cv: true
+  supervision:
+    source:
+      streamflow: true
+      ssm: true
+    target:
+      streamflow: false
+      ssm: true
+  references:
+    chapter3_summary: experiments/formal_ch3_modeling/06_summary/ch3_per_basin_with_metadata.csv
+    chapter4a_protocol: q_to_ssm
+    chapter4a_seed42: true
