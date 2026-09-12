@@ -66,7 +66,6 @@ FINAL_LOSS_WEIGHTS = {
     "streamflow": 1.0,
     "evapotranspiration": 0.1,
 }
-
 FINAL_CGC = {
     "shared_experts": 4,
     "task_experts": [4, 4],
@@ -194,7 +193,11 @@ def apply_common_config(base_cfg: Dict[str, Any], run: Dict[str, Any]) -> Dict[s
     cfg["experiment_tracking"]["save_gradient_diagnostics"] = run["architecture"] in {"hps", "mmoe", "cgc"}
 
     cfg.setdefault("evaluation_protocol", {})
-    cfg["evaluation_protocol"]["primary_metric"] = "streamflow_nse_median"
+
+    if run["targets"] == ["evapotranspiration"]:
+        cfg["evaluation_protocol"]["primary_metric"] = "evapotranspiration_nse_median"
+    else:
+        cfg["evaluation_protocol"]["primary_metric"] = "streamflow_nse_median"
 
     if run["architecture"] == "cgc":
         cfg.setdefault("model", {})
