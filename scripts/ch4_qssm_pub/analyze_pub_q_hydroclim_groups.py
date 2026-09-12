@@ -1,679 +1,555 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
-======================================================================
-Chapter 4 PUB Experiment
+Analyze hydroclimatic dependence of Chapter 4 Experiment 2 PUB results.
 
-Hydroclimatic Analysis of Streamflow Prediction
+The script uses the validated basin-level PUB transfer table to summarize
+absolute streamflow NSE and paired NSE differences across Dry, Snow, and Wet
+catchments.
 
-Purpose
--------
-Analyze whether auxiliary soil moisture information improves
-streamflow prediction under PUB conditions.
+Experiment:
+    SSM-assisted streamflow prediction under PUB conditions.
 
-Target variable
----------------
-Streamflow (Q)
+Target:
+    Streamflow (Q)
 
-Auxiliary variable
-------------------
-Soil surface moisture (SSM)
+Models:
+    STL-Q
+    Hard-MTL-Q
+    CGC-Q
 
-Models
-------
-STL-Q:
-    Single-task streamflow prediction
-
-Hard-MTL-Q:
-    Hard parameter sharing with auxiliary SSM task
-
-CGC-Q:
-    Customized Gate Control multi-task learning model
-
-
-Evaluation metrics
-------------------
-Absolute performance:
-
-    NSE_Q
-
-Transfer effect:
-
-    Delta NSE_Q =
-        NSE_Q(MTL) - NSE_Q(STL)
-
-
-Input
------
-experiments/ch4_qssm_pub/summary/
-
-    ch4b_pub_effects_with_ch3_metadata.csv
-
-
-Required columns
-----------------
-hydroclimate_group
-
-STL_Q_streamflow_nse
-
-Hard_MTL_streamflow_nse
-
-CGC_streamflow_nse
-
-Delta_NSE_HardMTL_minus_STLQ
-
-Delta_NSE_CGC_minus_STLQ
-
-
-Outputs
--------
-experiments/ch4_qssm_pub/hydroclimate_groups/
-
-    pub_q_hydroclimate_group_summary.csv
-
-    pub_q_absolute_nse_group_summary.csv
-
-    fig_pub_q_delta_nse_boxplot.png
-
-    fig_pub_q_absolute_nse.png
-
-    fig_pub_q_positive_transfer_rate.png
-
-
-======================================================================
+Outputs:
+    - pub_q_basin_hydroclimate_metrics.csv
+    - pub_q_absolute_nse_group_summary.csv
+    - pub_q_delta_nse_group_summary.csv
+    - pub_q_absolute_nse_by_hydroclimate.png
+    - pub_q_delta_nse_by_hydroclimate.png
 """
 
+from __future__ import annotations
 
-from pathlib import Path
 import argparse
 import logging
+from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-import matplotlib.pyplot as plt
-
-
-
-# ============================================================================
-# Paths
-# ============================================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-
 DEFAULT_INPUT = (
     PROJECT_ROOT
-    /
-    "experiments"
-    /
-    "ch4_qssm_pub"
-    /
-    "summary"
-    /
-    "ch4b_pub_effects_with_ch3_metadata.csv"
+    / "experiments/ch4_qssm_pub/hydroclimate_groups"
+    / "pub_q_transfer_analysis.csv"
 )
 
-
-DEFAULT_OUTPUT = (
+DEFAULT_OUTPUT_DIR = (
     PROJECT_ROOT
-    /
-    "experiments"
-    /
-    "ch4_qssm_pub"
-    /
-    "hydroclimate_groups"
+    / "experiments/ch4_qssm_pub/hydroclimate_groups"
 )
 
+EXPECTED_BASINS = 592
+EXPECTED_GROUP_COUNTS = {
+    "Dry": 142,
+    "Snow": 168,
+    "Wet": 282,
+}
 
+GROUP_ORDER = ["Dry", "Snow", "Wet"]
 
-# ============================================================================
-# Logging
-# ============================================================================
+MODEL_COLUMNS = {
+    "STL-Q": "STL_Q_NSE",
+    "Hard-MTL-Q": "Hard_MTL_Q_NSE",
+    "CGC-Q": "CGC_Q_NSE",
+}
+
+COMPARISONS = {
+    "Hard-MTL-Q minus STL-Q": "Delta_NSE_Q_Hard_minus_STL",
+    "CGC-Q minus STL-Q": "Delta_NSE_Q_CGC_minus_STL",
+    "CGC-Q minus Hard-MTL-Q": "Delta_NSE_Q_CGC_minus_Hard",
+}
 
 logger = logging.getLogger(__name__)
 
 
-def setup_logger():
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(levelname)s] %(message)s"
-    )
-
-
-
-# ============================================================================
-# Arguments
-# ============================================================================
-
-def parse_args():
-
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description=
-        "Analyze PUB streamflow prediction across hydroclimatic groups."
+        description=(
+            "Analyze PUB streamflow performance across "
+            "Dry, Snow, and Wet catchments."
+        )
     )
-
-
     parser.add_argument(
         "--input",
-        type=str,
-        default=str(DEFAULT_INPUT),
-        help="Path to PUB basin-level summary."
+        type=Path,
+        default=DEFAULT_INPUT,
+        help="Validated basin-level PUB transfer table.",
     )
-
-
     parser.add_argument(
-        "--output",
-        type=str,
-        default=str(DEFAULT_OUTPUT),
-        help="Output directory."
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help="Directory for hydroclimatic summaries and figures.",
     )
-
-
     return parser.parse_args()
 
 
-
-# ============================================================================
-# Data loading
-# ============================================================================
-
-def load_data(path):
-
-    logger.info(
-        f"Loading input file: {path}"
+def setup_logging() -> None:
+    """Configure compact console logging."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(levelname)s] %(message)s",
     )
 
 
-    df = pd.read_csv(path)
+def resolve_path(path: Path) -> Path:
+    """Resolve repository-relative paths."""
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
 
-    logger.info(
-        f"Loaded basins: {len(df)}"
+def normalize_gauge_id(series: pd.Series) -> pd.Series:
+    """Normalize USGS gauge IDs to eight-character strings."""
+    if series.isna().any():
+        raise ValueError("Missing gauge_id values detected.")
+
+    return (
+        series.astype(str)
+        .str.strip()
+        .str.replace(r"\.0$", "", regex=True)
+        .str.zfill(8)
     )
 
 
-    return df
-
-
-
-# ============================================================================
-# Validation
-# ============================================================================
-
-def validate_columns(df):
-
-
-    required_columns = [
-
-        "hydroclimate_group",
-
-        "STL_Q_streamflow_nse",
-
-        "Hard_MTL_streamflow_nse",
-
-        "CGC_streamflow_nse",
-
-        "Delta_NSE_HardMTL_minus_STLQ",
-
-        "Delta_NSE_CGC_minus_STLQ",
-
-    ]
-
-
-    missing = [
-
-        col for col in required_columns
-        if col not in df.columns
-
-    ]
-
-
+def require_columns(
+    frame: pd.DataFrame,
+    columns: set[str],
+    source: Path,
+) -> None:
+    """Require expected columns in an input table."""
+    missing = columns.difference(frame.columns)
     if missing:
-
         raise ValueError(
-            f"Missing required columns: {missing}"
+            f"Missing columns in {source}: {sorted(missing)}"
         )
 
 
-
-# ============================================================================
-# Absolute NSE_Q statistics
-# ============================================================================
-
-def calculate_absolute_nse_q(df):
-
-
-    model_columns = {
-
-        "STL-Q":
-            "STL_Q_streamflow_nse",
-
-        "Hard-MTL-Q":
-            "Hard_MTL_streamflow_nse",
-
-        "CGC-Q":
-            "CGC_streamflow_nse",
-
-    }
-
-
-    records = []
-
-
-    for group, group_df in df.groupby(
-        "hydroclimate_group"
-    ):
-
-
-        for model, column in model_columns.items():
-
-            values = group_df[column].dropna()
-
-
-            records.append(
-
-                {
-
-                    "hydroclimate_group":
-                        group,
-
-                    "model":
-                        model,
-
-                    "n_basins":
-                        len(values),
-
-                    "median_NSE_Q":
-                        values.median(),
-
-                    "mean_NSE_Q":
-                        values.mean(),
-
-                    "q25_NSE_Q":
-                        values.quantile(0.25),
-
-                    "q75_NSE_Q":
-                        values.quantile(0.75)
-
-                }
-
-            )
-
-
-    return pd.DataFrame(records)
-
-
-
-# ============================================================================
-# Delta NSE_Q statistics
-# ============================================================================
-
-def calculate_delta_nse_q(df):
-
-
-    comparison_columns = {
-
-        "Hard-MTL-Q minus STL-Q":
-            "Delta_NSE_HardMTL_minus_STLQ",
-
-        "CGC-Q minus STL-Q":
-            "Delta_NSE_CGC_minus_STLQ",
-
-    }
-
-
-    records = []
-
-
-    for group, group_df in df.groupby(
-        "hydroclimate_group"
-    ):
-
-
-        for name, column in comparison_columns.items():
-
-            values = group_df[column].dropna()
-
-
-            records.append(
-
-                {
-
-                    "hydroclimate_group":
-                        group,
-
-                    "comparison":
-                        name,
-
-                    "n_basins":
-                        len(values),
-
-                    "median_Delta_NSE_Q":
-                        values.median(),
-
-                    "mean_Delta_NSE_Q":
-                        values.mean(),
-
-                    "q25_Delta_NSE_Q":
-                        values.quantile(0.25),
-
-                    "q75_Delta_NSE_Q":
-                        values.quantile(0.75),
-
-                    "positive_transfer_rate":
-                        np.mean(values > 0),
-
-                    "negative_transfer_rate":
-                        np.mean(values < 0)
-
-                }
-
-            )
-
-
-    return pd.DataFrame(records)
-
-
-
-# ============================================================================
-# Plotting
-# ============================================================================
-
-def plot_delta_nse_boxplot(df, output):
-
-
-    groups = [
-        "Wet",
-        "Dry",
-        "Snow"
-    ]
-
-
-    values = []
-
-    labels = []
-
-
-    for group in groups:
-
-
-        data = df.loc[
-
-            df["hydroclimate_group"] == group,
-
-            "Delta_NSE_CGC_minus_STLQ"
-
-        ].dropna()
-
-
-        if len(data) > 0:
-
-            values.append(
-                data.values
-            )
-
-            labels.append(
-                group
-            )
-
-
-    plt.figure(
-        figsize=(6,4)
+def finite_values(series: pd.Series) -> pd.Series:
+    """Return finite numeric values only."""
+    values = pd.to_numeric(
+        series,
+        errors="coerce",
     )
-
-
-    plt.boxplot(
-
-        values,
-
-        tick_labels=labels,
-
-        showfliers=False
-
-    )
-
-
-    plt.axhline(
-        0,
-        linestyle="--"
-    )
-
-
-    plt.ylabel(
-        r"$\Delta NSE_Q$ (CGC-STL)"
-    )
-
-
-    plt.xlabel(
-        "Hydroclimatic group"
-    )
-
-
-    plt.tight_layout()
-
-
-    plt.savefig(
-
-        output /
-        "fig_pub_q_delta_nse_boxplot.png",
-
-        dpi=300
-
-    )
-
-
-    plt.close()
-
-
-
-def plot_absolute_nse(summary, output):
-
-
-    pivot = summary.pivot(
-
-        index="hydroclimate_group",
-
-        columns="model",
-
-        values="median_NSE_Q"
-
-    )
-
-
-    ax = pivot.plot(
-
-        kind="bar",
-
-        figsize=(6,4)
-
-    )
-
-
-    ax.set_xlabel(
-        "Hydroclimatic group"
-    )
-
-
-    ax.set_ylabel(
-        "Median NSE_Q"
-    )
-
-
-    plt.tight_layout()
-
-
-    plt.savefig(
-
-        output /
-        "fig_pub_q_absolute_nse.png",
-
-        dpi=300
-
-    )
-
-
-    plt.close()
-
-
-
-def plot_positive_transfer(summary, output):
-
-
-    data = summary.loc[
-
-        summary["comparison"]
-        ==
-        "CGC-Q minus STL-Q"
-
-    ]
-
-
-    plt.figure(
-        figsize=(5,4)
-    )
-
-
-    plt.bar(
-
-        data["hydroclimate_group"],
-
-        data["positive_transfer_rate"]
-
-    )
-
-
-    plt.ylim(
-        0,
-        1
-    )
-
-
-    plt.ylabel(
-        "Positive transfer rate"
-    )
-
-
-    plt.xlabel(
-        "Hydroclimatic group"
-    )
-
-
-    plt.tight_layout()
-
-
-    plt.savefig(
-
-        output /
-        "fig_pub_q_positive_transfer_rate.png",
-
-        dpi=300
-
-    )
-
-
-    plt.close()
-
-
-
-# ============================================================================
-# Main
-# ============================================================================
-
-def main():
-
-
-    setup_logger()
-
-
-    args = parse_args()
-
-
-    output = Path(
-        args.output
-    )
-
-
-    output.mkdir(
-
-        parents=True,
-
-        exist_ok=True
-
-    )
-
-
-    df = load_data(
-        args.input
-    )
-
-
-    validate_columns(df)
-
-
-
-    absolute_summary = (
-        calculate_absolute_nse_q(df)
-    )
-
-
-    delta_summary = (
-        calculate_delta_nse_q(df)
-    )
-
-
-
-    absolute_summary.to_csv(
-
-        output /
-        "pub_q_absolute_nse_group_summary.csv",
-
-        index=False
-
-    )
-
-
-    delta_summary.to_csv(
-
-        output /
-        "pub_q_hydroclimate_group_summary.csv",
-
-        index=False
-
-    )
-
+    return values[np.isfinite(values)]
+
+
+def load_analysis_table(path: Path) -> pd.DataFrame:
+    """Load and validate the formal PUB transfer table."""
+    if not path.exists():
+        raise FileNotFoundError(
+            f"PUB transfer table not found: {path}"
+        )
 
     logger.info(
-        "Statistics saved."
+        "Loading PUB transfer table: %s",
+        path,
     )
 
-
-    plot_delta_nse_boxplot(
-        df,
-        output
+    frame = pd.read_csv(
+        path,
+        dtype={"gauge_id": str},
     )
 
+    required = {
+        "gauge_id",
+        "aridity",
+        "frac_snow",
+        "hydroclimate_group",
+        *MODEL_COLUMNS.values(),
+        *COMPARISONS.values(),
+    }
+    require_columns(
+        frame,
+        required,
+        path,
+    )
+
+    frame["gauge_id"] = normalize_gauge_id(
+        frame["gauge_id"]
+    )
+
+    if frame["gauge_id"].duplicated().any():
+        raise ValueError(
+            "Duplicated gauge_id values in PUB transfer table."
+        )
+
+    if len(frame) != EXPECTED_BASINS:
+        raise RuntimeError(
+            f"Expected {EXPECTED_BASINS} basins, "
+            f"found {len(frame)}."
+        )
+
+    numeric_columns = [
+        *MODEL_COLUMNS.values(),
+        *COMPARISONS.values(),
+    ]
+    for column in numeric_columns:
+        frame[column] = pd.to_numeric(
+            frame[column],
+            errors="coerce",
+        )
+
+    counts = (
+        frame["hydroclimate_group"]
+        .value_counts()
+        .to_dict()
+    )
+
+    if counts != EXPECTED_GROUP_COUNTS:
+        raise RuntimeError(
+            "Unexpected hydroclimate counts: "
+            f"{counts}; expected {EXPECTED_GROUP_COUNTS}."
+        )
+
+    logger.info(
+        "Loaded %d PUB basins.",
+        len(frame),
+    )
+    logger.info(
+        "Hydroclimate groups: %s",
+        counts,
+    )
+
+    return frame
+
+
+def summarize_absolute_nse(
+    frame: pd.DataFrame,
+) -> pd.DataFrame:
+    """Summarize absolute streamflow NSE by model and hydroclimate group."""
+    records: list[dict[str, object]] = []
+
+    for group in GROUP_ORDER:
+        subset = frame[
+            frame["hydroclimate_group"] == group
+        ]
+
+        for model, column in MODEL_COLUMNS.items():
+            values = finite_values(
+                subset[column]
+            )
+
+            records.append({
+                "hydroclimate_group": group,
+                "model": model,
+                "n_basins": len(values),
+                "median_NSE_Q": values.median(),
+                "mean_NSE_Q": values.mean(),
+                "q25_NSE_Q": values.quantile(0.25),
+                "q75_NSE_Q": values.quantile(0.75),
+                "NSE_Q_ge_0_rate":
+                    float((values >= 0.0).mean()),
+                "NSE_Q_ge_0p50_rate":
+                    float((values >= 0.50).mean()),
+                "NSE_Q_ge_0p60_rate":
+                    float((values >= 0.60).mean()),
+            })
+
+    return pd.DataFrame(records)
+
+
+def summarize_delta_nse(
+    frame: pd.DataFrame,
+) -> pd.DataFrame:
+    """Summarize basin-wise paired NSE differences."""
+    records: list[dict[str, object]] = []
+
+    for group in GROUP_ORDER:
+        subset = frame[
+            frame["hydroclimate_group"] == group
+        ]
+
+        for comparison, column in COMPARISONS.items():
+            delta = finite_values(
+                subset[column]
+            )
+
+            records.append({
+                "hydroclimate_group": group,
+                "comparison": comparison,
+                "n_basins": len(delta),
+                "median_Delta_NSE_Q":
+                    delta.median(),
+                "mean_Delta_NSE_Q":
+                    delta.mean(),
+                "q25_Delta_NSE_Q":
+                    delta.quantile(0.25),
+                "q75_Delta_NSE_Q":
+                    delta.quantile(0.75),
+                "positive_rate":
+                    float((delta > 0).mean()),
+                "negative_rate":
+                    float((delta < 0).mean()),
+                "zero_rate":
+                    float((delta == 0).mean()),
+            })
+
+    return pd.DataFrame(records)
+
+
+def plot_absolute_nse(
+    frame: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    """Plot absolute NSE distributions by hydroclimate group."""
+    fig, ax = plt.subplots(
+        figsize=(9.0, 5.0),
+    )
+
+    positions: list[float] = []
+    data: list[np.ndarray] = []
+
+    offsets = [-0.25, 0.0, 0.25]
+    model_names = list(MODEL_COLUMNS)
+
+    for group_index, group in enumerate(
+        GROUP_ORDER
+    ):
+        subset = frame[
+            frame["hydroclimate_group"] == group
+        ]
+
+        for offset, model in zip(
+            offsets,
+            model_names,
+        ):
+            values = finite_values(
+                subset[MODEL_COLUMNS[model]]
+            ).to_numpy(dtype=float)
+
+            positions.append(
+                group_index + 1 + offset
+            )
+            data.append(values)
+
+    box = ax.boxplot(
+        data,
+        positions=positions,
+        widths=0.20,
+        patch_artist=False,
+        showfliers=False,
+        medianprops={"linewidth": 1.5},
+    )
+
+    for index, median in enumerate(
+        box["medians"][:len(model_names)]
+    ):
+        median.set_label(
+            model_names[index]
+        )
+
+    ax.axhline(
+        0.0,
+        linewidth=0.8,
+        linestyle="--",
+    )
+    ax.set_xticks(
+        range(1, len(GROUP_ORDER) + 1)
+    )
+    ax.set_xticklabels(
+        GROUP_ORDER
+    )
+    ax.set_xlabel(
+        "Hydroclimate group"
+    )
+    ax.set_ylabel(
+        "NSE"
+    )
+    ax.legend(
+        loc="best",
+        frameon=False,
+    )
+
+    fig.tight_layout()
+    fig.savefig(
+        output_path,
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+
+
+def plot_delta_nse(
+    frame: pd.DataFrame,
+    output_path: Path,
+) -> None:
+    """Plot paired NSE differences by hydroclimate group."""
+    fig, ax = plt.subplots(
+        figsize=(9.0, 5.0),
+    )
+
+    positions: list[float] = []
+    data: list[np.ndarray] = []
+
+    offsets = [-0.25, 0.0, 0.25]
+    comparison_names = list(COMPARISONS)
+
+    for group_index, group in enumerate(
+        GROUP_ORDER
+    ):
+        subset = frame[
+            frame["hydroclimate_group"] == group
+        ]
+
+        for offset, comparison in zip(
+            offsets,
+            comparison_names,
+        ):
+            values = finite_values(
+                subset[COMPARISONS[comparison]]
+            ).to_numpy(dtype=float)
+
+            positions.append(
+                group_index + 1 + offset
+            )
+            data.append(values)
+
+    box = ax.boxplot(
+        data,
+        positions=positions,
+        widths=0.20,
+        patch_artist=False,
+        showfliers=False,
+        medianprops={"linewidth": 1.5},
+    )
+
+    for index, median in enumerate(
+        box["medians"][:len(comparison_names)]
+    ):
+        median.set_label(
+            comparison_names[index]
+        )
+
+    ax.axhline(
+        0.0,
+        linewidth=0.8,
+        linestyle="--",
+    )
+    ax.set_xticks(
+        range(1, len(GROUP_ORDER) + 1)
+    )
+    ax.set_xticklabels(
+        GROUP_ORDER
+    )
+    ax.set_xlabel(
+        "Hydroclimate group"
+    )
+    ax.set_ylabel(
+        r"$\Delta$NSE"
+    )
+    ax.legend(
+        loc="best",
+        frameon=False,
+    )
+
+    fig.tight_layout()
+    fig.savefig(
+        output_path,
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+
+
+def main() -> None:
+    """Run the PUB hydroclimatic analysis."""
+    setup_logging()
+    args = parse_args()
+
+    input_path = resolve_path(
+        args.input
+    )
+    output_dir = resolve_path(
+        args.output_dir
+    )
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    frame = load_analysis_table(
+        input_path
+    )
+
+    absolute = summarize_absolute_nse(
+        frame
+    )
+    delta = summarize_delta_nse(
+        frame
+    )
+
+    basin_path = (
+        output_dir
+        / "pub_q_basin_hydroclimate_metrics.csv"
+    )
+    absolute_path = (
+        output_dir
+        / "pub_q_absolute_nse_group_summary.csv"
+    )
+    delta_path = (
+        output_dir
+        / "pub_q_delta_nse_group_summary.csv"
+    )
+
+    frame.to_csv(
+        basin_path,
+        index=False,
+    )
+    absolute.to_csv(
+        absolute_path,
+        index=False,
+    )
+    delta.to_csv(
+        delta_path,
+        index=False,
+    )
 
     plot_absolute_nse(
-        absolute_summary,
-        output
+        frame,
+        output_dir
+        / "pub_q_absolute_nse_by_hydroclimate.png",
+    )
+    plot_delta_nse(
+        frame,
+        output_dir
+        / "pub_q_delta_nse_by_hydroclimate.png",
     )
 
-
-    plot_positive_transfer(
-        delta_summary,
-        output
+    logger.info(
+        "Median NSE: STL=%.6f, Hard=%.6f, CGC=%.6f",
+        frame["STL_Q_NSE"].median(),
+        frame["Hard_MTL_Q_NSE"].median(),
+        frame["CGC_Q_NSE"].median(),
     )
-
-
+    logger.info(
+        "Saved basin metrics: %s",
+        basin_path,
+    )
+    logger.info(
+        "Saved absolute NSE summary: %s",
+        absolute_path,
+    )
+    logger.info(
+        "Saved Delta NSE summary: %s",
+        delta_path,
+    )
     logger.info(
         "PUB Q hydroclimatic analysis completed."
     )
 
 
-
 if __name__ == "__main__":
-
     main()

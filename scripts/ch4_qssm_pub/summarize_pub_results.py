@@ -1,19 +1,33 @@
 #!/usr/bin/env python3
-"""Summarize formal Chapter 4B PUB streamflow effects.
+# -*- coding: utf-8 -*-
 
-Formal PUB evaluation is target-basin streamflow only.  Target-basin SSM is an
-auxiliary training signal in the assisted MTL scenarios and is therefore not
-reported as an independent out-of-sample test target over the same period.
+"""
+Summarize formal Chapter 4B PUB streamflow results.
+
+This script is restricted to Chapter 4B PUB outputs. It collects formal
+per-basin metrics across spatial folds, builds basin-wise absolute streamflow
+NSE values, and summarizes paired performance differences among STL-Q,
+Hard-MTL, and CGC.
+
+Chapter 3 results and hydroclimatic metadata are intentionally excluded.
+Cross-experiment merging is handled separately.
+
+Outputs:
+    - ch4b_pub_ensemble_per_basin_metrics.csv
+    - ch4b_pub_effects.csv
+    - ch4b_pub_model_effect_summary.csv
 """
 
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -21,19 +35,39 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from mtl_cgc.protocols.ch4_qssm_pub.io_utils import normalize_basin_id  # noqa: E402
 from mtl_cgc.protocols.ch4_qssm_pub.paths import (  # noqa: E402
-    CH3_SUMMARY,
     ENSEMBLE_DIR,
     SUMMARY_DIR,
 )
 
 
 DEFAULT_ENSEMBLE_INDEX = ENSEMBLE_DIR / "ensemble_index.csv"
+EXPECTED_BASINS = 592
+
+PUB_SCENARIOS = {
+    "stl_q": "PUB_STL_Q_NSE",
+    "hps_target_ssm": "PUB_Hard_MTL_Q_NSE",
+    "cgc_target_ssm": "PUB_CGC_Q_NSE",
+}
+
+COMPARISONS = {
+    "Hard-MTL-PUB": "delta_nse_hps_minus_stl",
+    "CGC-PUB": "delta_nse_cgc_minus_stl",
+    "CGC-minus-Hard": "delta_nse_cgc_minus_hps",
+}
+
+logger = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ensemble-index", type=Path, default=DEFAULT_ENSEMBLE_INDEX)
-    parser.add_argument("--ch3-summary", type=Path, default=CH3_SUMMARY)
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Summarize formal Chapter 4B PUB streamflow results."
+    )
+    parser.add_argument(
+        "--ensemble-index",
+        type=Path,
+        default=DEFAULT_ENSEMBLE_INDEX,
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -42,166 +76,300 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def setup_logging() -> None:
+    """Configure compact console logging."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(levelname)s] %(message)s",
+    )
+
+
+def resolve_path(path: Path) -> Path:
+    """Resolve repository-relative paths."""
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
 def normalize_id_column(frame: pd.DataFrame) -> pd.DataFrame:
+    """Normalize the basin identifier column."""
     frame = frame.copy()
-    for candidate in ("gauge_id", "basin_id", "gage_id", "Unnamed: 0", frame.columns[0]):
-        if candidate in frame.columns:
-            frame = frame.rename(columns={candidate: "gauge_id"})
-            frame["gauge_id"] = frame["gauge_id"].map(normalize_basin_id)
-            return frame
+
+    candidates = (
+        "gauge_id",
+        "basin_id",
+        "gage_id",
+        "Unnamed: 0",
+        frame.columns[0],
+    )
+
+    for candidate in candidates:
+        if candidate not in frame.columns:
+            continue
+
+        frame = frame.rename(columns={candidate: "gauge_id"})
+        frame["gauge_id"] = frame["gauge_id"].map(normalize_basin_id)
+        return frame
+
     raise ValueError("Cannot identify basin-id column.")
 
 
-def hydroclimate_group(frame: pd.DataFrame) -> pd.Series:
-    """Stein-style Wet / Dry / Snow grouping used for cross-chapter interpretation."""
-
-    group = pd.Series(index=frame.index, dtype="object")
-    snow = pd.to_numeric(frame["frac_snow"], errors="coerce") > 0.20
-    aridity = pd.to_numeric(frame["aridity"], errors="coerce")
-    group.loc[snow] = "Snow"
-    group.loc[(~snow) & (aridity < 1.0)] = "Wet"
-    group.loc[(~snow) & (aridity >= 1.0)] = "Dry"
-    return group
-
-
 def load_ensemble(index_path: Path) -> pd.DataFrame:
+    """Load formal PUB per-basin metrics from all spatial folds."""
+    if not index_path.exists():
+        raise FileNotFoundError(
+            f"Ensemble index not found: {index_path}"
+        )
+
     index = pd.read_csv(index_path)
+
+    required = {
+        "metrics_csv",
+        "fold_id",
+        "scenario",
+        "seed_count",
+    }
+    missing = required.difference(index.columns)
+    if missing:
+        raise ValueError(
+            f"Missing ensemble-index columns: {sorted(missing)}"
+        )
+
     frames: list[pd.DataFrame] = []
+
     for _, row in index.iterrows():
-        path = Path(str(row["metrics_csv"]))
-        if not path.is_absolute():
-            path = PROJECT_ROOT / path
-        metrics = normalize_id_column(pd.read_csv(path))
+        metrics_path = resolve_path(
+            Path(str(row["metrics_csv"]))
+        )
+
+        if not metrics_path.exists():
+            raise FileNotFoundError(
+                f"Metrics file not found: {metrics_path}"
+            )
+
+        metrics = normalize_id_column(
+            pd.read_csv(
+                metrics_path,
+                dtype={"gauge_id": str},
+            )
+        )
+
+        if "streamflow_nse" not in metrics.columns:
+            raise ValueError(
+                f"Missing streamflow_nse in {metrics_path}"
+            )
+
         metrics["fold_id"] = int(row["fold_id"])
         metrics["scenario"] = str(row["scenario"])
         metrics["seed_count"] = int(row["seed_count"])
         frames.append(metrics)
+
     if not frames:
         raise RuntimeError("No ensemble metric files found.")
-    return pd.concat(frames, ignore_index=True)
+
+    frame = pd.concat(
+        frames,
+        ignore_index=True,
+    )
+
+    duplicates = frame.duplicated(
+        ["scenario", "gauge_id"]
+    )
+    if duplicates.any():
+        rows = frame.loc[
+            duplicates,
+            ["scenario", "gauge_id", "fold_id"],
+        ]
+        raise ValueError(
+            "A basin appears more than once per scenario:\n"
+            f"{rows.head()}"
+        )
+
+    return frame
+
+
+def validate_pub_scenarios(
+    frame: pd.DataFrame,
+) -> None:
+    """Validate formal PUB scenario coverage."""
+    available = set(frame["scenario"].unique())
+    missing = set(PUB_SCENARIOS).difference(available)
+
+    if missing:
+        raise ValueError(
+            f"Missing core PUB scenarios: {sorted(missing)}"
+        )
+
+    for scenario in PUB_SCENARIOS:
+        count = int(
+            frame.loc[
+                frame["scenario"] == scenario,
+                "gauge_id",
+            ].nunique()
+        )
+
+        if count != EXPECTED_BASINS:
+            raise RuntimeError(
+                f"{scenario}: expected {EXPECTED_BASINS} "
+                f"basins, found {count}."
+            )
+
+
+def build_pub_effects(
+    all_metrics: pd.DataFrame,
+) -> pd.DataFrame:
+    """Build basin-wise absolute and paired PUB NSE results."""
+    validate_pub_scenarios(all_metrics)
+
+    effects = (
+        all_metrics.pivot(
+            index="gauge_id",
+            columns="scenario",
+            values="streamflow_nse",
+        )
+        .reset_index()
+    )
+
+    for scenario, alias in PUB_SCENARIOS.items():
+        effects[alias] = effects[scenario]
+
+    effects["delta_nse_hps_minus_stl"] = (
+        effects["hps_target_ssm"]
+        - effects["stl_q"]
+    )
+    effects["delta_nse_cgc_minus_stl"] = (
+        effects["cgc_target_ssm"]
+        - effects["stl_q"]
+    )
+    effects["delta_nse_cgc_minus_hps"] = (
+        effects["cgc_target_ssm"]
+        - effects["hps_target_ssm"]
+    )
+
+    effects["hps_positive_transfer"] = (
+        effects["delta_nse_hps_minus_stl"] > 0
+    )
+    effects["cgc_positive_transfer"] = (
+        effects["delta_nse_cgc_minus_stl"] > 0
+    )
+    effects["hps_negative_transfer"] = (
+        effects["delta_nse_hps_minus_stl"] < 0
+    )
+    effects["cgc_negative_transfer"] = (
+        effects["delta_nse_cgc_minus_stl"] < 0
+    )
+
+    fold_lookup = all_metrics.loc[
+        all_metrics["scenario"] == "stl_q",
+        ["gauge_id", "fold_id"],
+    ]
+
+    effects = effects.merge(
+        fold_lookup,
+        on="gauge_id",
+        how="left",
+        validate="one_to_one",
+    )
+
+    if len(effects) != EXPECTED_BASINS:
+        raise RuntimeError(
+            f"Expected {EXPECTED_BASINS} PUB basins, "
+            f"found {len(effects)}."
+        )
+
+    return effects
+
+
+def summarize_effects(
+    effects: pd.DataFrame,
+) -> pd.DataFrame:
+    """Summarize paired PUB NSE effects."""
+    records: list[dict[str, object]] = []
+
+    for comparison, column in COMPARISONS.items():
+        values = pd.to_numeric(
+            effects[column],
+            errors="coerce",
+        )
+        values = values[np.isfinite(values)]
+
+        records.append({
+            "comparison": comparison,
+            "n_basins": len(values),
+            "median_delta_nse": values.median(),
+            "mean_delta_nse": values.mean(),
+            "q25_delta_nse": values.quantile(0.25),
+            "q75_delta_nse": values.quantile(0.75),
+            "positive_rate":
+                float((values > 0).mean()),
+            "negative_rate":
+                float((values < 0).mean()),
+        })
+
+    return pd.DataFrame(records)
 
 
 def main() -> None:
+    """Run the Chapter 4B PUB summary workflow."""
+    setup_logging()
     args = parse_args()
-    index_path = (
-        args.ensemble_index
-        if args.ensemble_index.is_absolute()
-        else PROJECT_ROOT / args.ensemble_index
+
+    index_path = resolve_path(args.ensemble_index)
+    output_dir = resolve_path(args.output_dir)
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
     )
-    ch3_path = (
-        args.ch3_summary
-        if args.ch3_summary.is_absolute()
-        else PROJECT_ROOT / args.ch3_summary
-    )
-    out_dir = args.output_dir if args.output_dir.is_absolute() else PROJECT_ROOT / args.output_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     all_metrics = load_ensemble(index_path)
-    if all_metrics.duplicated(["scenario", "gauge_id"]).any():
-        dup = all_metrics.loc[
-            all_metrics.duplicated(["scenario", "gauge_id"], keep=False),
-            ["scenario", "gauge_id", "fold_id"],
-        ]
-        raise ValueError(f"A target basin appears more than once per scenario:\n{dup.head()}")
-    all_metrics.to_csv(out_dir / "ch4b_pub_ensemble_per_basin_metrics.csv", index=False)
 
-    nse = all_metrics.pivot(
-        index="gauge_id", columns="scenario", values="streamflow_nse"
-    ).reset_index()
-    required = {"stl_q", "hps_target_ssm", "cgc_target_ssm"}
-    missing = required - set(nse.columns)
-    if missing:
-        raise ValueError(f"Missing core PUB scenarios: {sorted(missing)}")
+    ensemble_path = (
+        output_dir
+        / "ch4b_pub_ensemble_per_basin_metrics.csv"
+    )
+    all_metrics.to_csv(
+        ensemble_path,
+        index=False,
+    )
 
-    effects = nse.copy()
-    effects["delta_nse_hps_minus_stl"] = effects["hps_target_ssm"] - effects["stl_q"]
-    effects["delta_nse_cgc_minus_stl"] = effects["cgc_target_ssm"] - effects["stl_q"]
-    effects["delta_nse_cgc_minus_hps"] = effects["cgc_target_ssm"] - effects["hps_target_ssm"]
-    effects["hps_positive_transfer"] = effects["delta_nse_hps_minus_stl"] > 0
-    effects["cgc_positive_transfer"] = effects["delta_nse_cgc_minus_stl"] > 0
-    effects["hps_negative_transfer"] = effects["delta_nse_hps_minus_stl"] < 0
-    effects["cgc_negative_transfer"] = effects["delta_nse_cgc_minus_stl"] < 0
+    effects = build_pub_effects(all_metrics)
 
-    fold_lookup = all_metrics.loc[all_metrics["scenario"] == "stl_q", ["gauge_id", "fold_id"]]
-    effects = effects.merge(fold_lookup, on="gauge_id", how="left", validate="one_to_one")
+    effects_path = (
+        output_dir
+        / "ch4b_pub_effects.csv"
+    )
+    effects.to_csv(
+        effects_path,
+        index=False,
+    )
 
-    if ch3_path.exists():
-        ch3 = normalize_id_column(pd.read_csv(ch3_path))
-        keep = [
-            col
-            for col in (
-                "gauge_id",
-                "huc_02",
-                "aridity",
-                "frac_snow",
-                "p_seasonality",
-                "max_water_content",
-                "STL_Q_streamflow_nse",
-                "Hard_MTL_streamflow_nse",
-                "MMoE_streamflow_nse",
-                "CGC_streamflow_nse",
-                "STL_ET_evapotranspiration_nse",
-                "Hard_MTL_evapotranspiration_nse",
-                "MMoE_evapotranspiration_nse",
-                "CGC_evapotranspiration_nse",
-                "Delta_NSE_HardMTL_minus_STLQ",
-                "Delta_NSE_MMoE_minus_STLQ",
-                "Delta_NSE_CGC_minus_STLQ",
-            )
-            if col in ch3.columns
-        ]
-        ch3 = ch3[keep].drop_duplicates("gauge_id")
-        effects = effects.merge(ch3, on="gauge_id", how="left", validate="one_to_one")
-        if {"aridity", "frac_snow"}.issubset(effects.columns):
-            effects["hydroclimate_group"] = hydroclimate_group(effects)
+    summary = summarize_effects(effects)
 
-    effects.to_csv(out_dir / "ch4b_pub_effects_with_ch3_metadata.csv", index=False)
+    summary_path = (
+        output_dir
+        / "ch4b_pub_model_effect_summary.csv"
+    )
+    summary.to_csv(
+        summary_path,
+        index=False,
+    )
 
-    rows = []
-    for model, column in (
-        ("Hard-MTL-PUB", "delta_nse_hps_minus_stl"),
-        ("CGC-PUB", "delta_nse_cgc_minus_stl"),
-        ("CGC-minus-Hard", "delta_nse_cgc_minus_hps"),
-    ):
-        values = pd.to_numeric(effects[column], errors="coerce").dropna()
-        rows.append(
-            {
-                "comparison": model,
-                "n_basins": len(values),
-                "median_delta_nse": values.median(),
-                "mean_delta_nse": values.mean(),
-                "q25_delta_nse": values.quantile(0.25),
-                "q75_delta_nse": values.quantile(0.75),
-                "positive_rate": float((values > 0).mean()),
-                "negative_rate": float((values < 0).mean()),
-            }
-        )
-    pd.DataFrame(rows).to_csv(out_dir / "ch4b_pub_model_effect_summary.csv", index=False)
-
-    if "hydroclimate_group" in effects.columns:
-        group_rows = []
-        for group_name, group in effects.groupby("hydroclimate_group", dropna=True):
-            for model, column in (
-                ("Hard-MTL-PUB", "delta_nse_hps_minus_stl"),
-                ("CGC-PUB", "delta_nse_cgc_minus_stl"),
-                ("CGC-minus-Hard", "delta_nse_cgc_minus_hps"),
-            ):
-                values = pd.to_numeric(group[column], errors="coerce").dropna()
-                group_rows.append(
-                    {
-                        "hydroclimate_group": group_name,
-                        "comparison": model,
-                        "n_basins": len(values),
-                        "median_delta_nse": values.median(),
-                        "positive_rate": float((values > 0).mean()) if len(values) else np.nan,
-                        "negative_rate": float((values < 0).mean()) if len(values) else np.nan,
-                    }
-                )
-        pd.DataFrame(group_rows).to_csv(
-            out_dir / "ch4b_pub_hydroclimate_group_summary.csv", index=False
-        )
-
-    print(f"PUB summaries exported to: {out_dir}")
+    logger.info(
+        "PUB median NSE: STL=%.6f, Hard=%.6f, CGC=%.6f",
+        effects["PUB_STL_Q_NSE"].median(),
+        effects["PUB_Hard_MTL_Q_NSE"].median(),
+        effects["PUB_CGC_Q_NSE"].median(),
+    )
+    logger.info(
+        "Saved ensemble metrics: %s",
+        ensemble_path,
+    )
+    logger.info(
+        "Saved PUB effects: %s",
+        effects_path,
+    )
+    logger.info(
+        "Saved model-effect summary: %s",
+        summary_path,
+    )
 
 
 if __name__ == "__main__":

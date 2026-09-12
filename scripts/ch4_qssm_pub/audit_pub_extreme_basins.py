@@ -46,7 +46,7 @@ import xarray as xr
 
 
 DEFAULT_SUMMARY = Path(
-    "experiments/ch4_qssm_pub/summary/ch4b_pub_effects_with_ch3_metadata.csv"
+    "experiments/ch4_qssm_pub/summary/ch4b_pub_effects.csv"
 )
 DEFAULT_ENSEMBLE_DIR = Path("experiments/ch4_qssm_pub/ensemble")
 DEFAULT_OUTPUT_DIR = Path("experiments/ch4_qssm_pub/extreme_audit")

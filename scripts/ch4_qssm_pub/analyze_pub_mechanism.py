@@ -44,7 +44,7 @@ from scipy.stats import spearmanr, trim_mean, wilcoxon
 
 
 DEFAULT_INPUT = Path(
-    "experiments/ch4_qssm_pub/summary/ch4b_pub_effects_with_ch3_metadata.csv"
+    "experiments/ch4_qssm_pub/summary/ch4b_pub_effects.csv"
 )
 DEFAULT_OUTPUT_DIR = Path(
     "experiments/ch4_qssm_pub/mechanism"
