@@ -22,13 +22,14 @@ from matplotlib.patches import Patch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CH3_DIR = PROJECT_ROOT / "experiments" / "formal_ch3_modeling"
-SUMMARY_DIR = CH3_DIR / "06_summary"
+SUMMARY_ROOT = CH3_DIR / "06_summary"
+SUMMARY_DIR = SUMMARY_ROOT / "test"
 FIG_DIR = CH3_DIR / "figures"
 
 PER_BASIN_PATH = SUMMARY_DIR / "ch3_per_basin_all_models.csv"
 TRANSFER_LONG_PATH = SUMMARY_DIR / "ch3_transfer_long.csv"
-GATE_SUMMARY_PATH = SUMMARY_DIR / "ch3_gate_utilization_summary.csv"
-GATE_LONG_PATH = SUMMARY_DIR / "ch3_gate_utilization_long.csv"
+GATE_SUMMARY_PATH = SUMMARY_ROOT / "ch3_gate_utilization_summary.csv"
+GATE_LONG_PATH = SUMMARY_ROOT / "ch3_gate_utilization_long.csv"
 SPATIAL_GPKG_PATH = SUMMARY_DIR / "ch3_spatial_basin_metrics.gpkg"
 
 BASIN_SHP_PATH = Path(
