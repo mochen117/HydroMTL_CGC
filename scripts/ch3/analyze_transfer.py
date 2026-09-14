@@ -24,7 +24,7 @@ import pandas as pd
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SUMMARY_DIR = PROJECT_ROOT / "experiments" / "formal_ch3_modeling" / "06_summary"
+SUMMARY_DIR = PROJECT_ROOT / "experiments" / "formal_ch3_modeling" / "06_summary" / "test"
 
 INPUT_PATH = SUMMARY_DIR / "ch3_per_basin_all_models.csv"
 TRANSFER_LONG_PATH = SUMMARY_DIR / "ch3_transfer_long.csv"

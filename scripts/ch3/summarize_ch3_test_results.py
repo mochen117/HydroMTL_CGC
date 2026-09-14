@@ -63,11 +63,13 @@ RUNS = {
 }
 
 MODEL_SLUG = {
-    "STL-Q": "stl_q",
-    "STL-ET": "stl_et",
-    "Hard-MTL": "hard_mtl",
-    "MMoE": "mmoe",
-    "CGC": "cgc",
+    # Keep the historical Chapter 3 column convention so that
+    # existing analysis/plotting scripts remain compatible.
+    "STL-Q": "STL_Q",
+    "STL-ET": "STL_ET",
+    "Hard-MTL": "Hard_MTL",
+    "MMoE": "MMoE",
+    "CGC": "CGC",
 }
 
 MTL_MODELS = [
@@ -283,6 +285,64 @@ def build_combined_per_basin(
             on=id_col,
             how="left",
             validate="one_to_one",
+        )
+
+    # Historical Chapter 3 Delta_NSE columns retained for compatibility
+    # with audit, sensitivity-analysis, and plotting scripts.
+    delta_rules = {
+        "Delta_NSE_HardMTL_minus_STLQ": (
+            "Hard_MTL_streamflow_nse",
+            "STL_Q_streamflow_nse",
+        ),
+        "Delta_NSE_MMoE_minus_STLQ": (
+            "MMoE_streamflow_nse",
+            "STL_Q_streamflow_nse",
+        ),
+        "Delta_NSE_CGC_minus_STLQ": (
+            "CGC_streamflow_nse",
+            "STL_Q_streamflow_nse",
+        ),
+        "Delta_NSE_HardMTL_ET_minus_STLET": (
+            "Hard_MTL_evapotranspiration_nse",
+            "STL_ET_evapotranspiration_nse",
+        ),
+        "Delta_NSE_MMoE_ET_minus_STLET": (
+            "MMoE_evapotranspiration_nse",
+            "STL_ET_evapotranspiration_nse",
+        ),
+        "Delta_NSE_CGC_ET_minus_STLET": (
+            "CGC_evapotranspiration_nse",
+            "STL_ET_evapotranspiration_nse",
+        ),
+
+        # Pairwise CGC-minus-MTL differences used by spatial diagnostics.
+        "Delta_NSE_CGC_minus_HardMTL": (
+            "CGC_streamflow_nse",
+            "Hard_MTL_streamflow_nse",
+        ),
+        "Delta_NSE_CGC_minus_MMoE": (
+            "CGC_streamflow_nse",
+            "MMoE_streamflow_nse",
+        ),
+        "Delta_NSE_CGC_ET_minus_HardMTL": (
+            "CGC_evapotranspiration_nse",
+            "Hard_MTL_evapotranspiration_nse",
+        ),
+        "Delta_NSE_CGC_ET_minus_MMoE": (
+            "CGC_evapotranspiration_nse",
+            "MMoE_evapotranspiration_nse",
+        ),
+    }
+
+    for delta_col, (model_col, baseline_col) in delta_rules.items():
+        if model_col not in combined.columns:
+            raise RuntimeError(f"Missing model metric column: {model_col}")
+        if baseline_col not in combined.columns:
+            raise RuntimeError(f"Missing baseline metric column: {baseline_col}")
+
+        combined[delta_col] = (
+            pd.to_numeric(combined[model_col], errors="coerce")
+            - pd.to_numeric(combined[baseline_col], errors="coerce")
         )
 
     return combined

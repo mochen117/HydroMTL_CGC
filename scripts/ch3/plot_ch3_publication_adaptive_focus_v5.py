@@ -65,15 +65,16 @@ except ImportError:  # pragma: no cover - p-values are reported as NaN.
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CH3_DIR = PROJECT_ROOT / "experiments" / "formal_ch3_modeling"
-SUMMARY_DIR = CH3_DIR / "06_summary"
+SUMMARY_ROOT = CH3_DIR / "06_summary"
+SUMMARY_DIR = SUMMARY_ROOT / "test"
 FIGURE_VARIANT = "publication_adaptive_focus_v5"
 BASE_FIG_DIR = CH3_DIR / "figures"
 FIG_DIR = BASE_FIG_DIR / FIGURE_VARIANT
 SUPPLEMENTARY_FIG_DIR = FIG_DIR / "supplementary"
 
 PER_BASIN_PATH = SUMMARY_DIR / "ch3_per_basin_all_models.csv"
-GATE_SUMMARY_PATH = SUMMARY_DIR / "ch3_gate_utilization_summary.csv"
-GATE_LONG_PATH = SUMMARY_DIR / "ch3_gate_utilization_long.csv"
+GATE_SUMMARY_PATH = SUMMARY_ROOT / "ch3_gate_utilization_summary.csv"
+GATE_LONG_PATH = SUMMARY_ROOT / "ch3_gate_utilization_long.csv"
 
 TRANSFER_ANALYSIS_PATH = SUMMARY_DIR / "ch3_transfer_analysis_table.csv"
 PAIRWISE_STATS_PATH = SUMMARY_DIR / "ch3_pairwise_statistics.csv"

@@ -22,7 +22,7 @@ from matplotlib.colors import TwoSlopeNorm
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 CH3_DIR = PROJECT_ROOT / "experiments" / "formal_ch3_modeling"
-SUMMARY_DIR = CH3_DIR / "06_summary"
+SUMMARY_DIR = CH3_DIR / "06_summary" / "test"
 FIG_DIR = CH3_DIR / "figures"
 
 INPUT_PATH = SUMMARY_DIR / "ch3_per_basin_with_metadata.csv"
